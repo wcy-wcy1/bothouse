@@ -1,0 +1,14 @@
+# Append this platform block inside the existing project's TOML scope.
+# On the lead, use the remote loopback port and the lead bot/mention IDs.
+# On the worker, use the local port and keep team_lead_bot set to the lead ID.
+[[projects.platforms]]
+type = "cloud_web"
+
+[projects.platforms.options]
+transport = "websocket"
+ws_url = "${BOTHOUSE_LOBBY_WS_URL}"
+token = "${BOTHOUSE_LOBBY_BOT_TOKEN}"
+allow_from = "user"
+share_session_in_channel = true
+group_reply_all = false
+team_lead_bot = "${BOTHOUSE_LOBBY_LEAD_MENTION_ID}"
