@@ -1,0 +1,14 @@
+hub_url = "http://127.0.0.1:8790"
+hub_state = "%USERPROFILE%/.bothouse/hub/hub.json"
+sender_credential = "%USERPROFILE%/.bothouse/hub/discord-relay/discord-token.dpapi"
+
+# Replace these four example snowflakes before starting.
+guild = "10000000000000001"
+channel = "10000000000000002"
+sender_bot = "10000000000000003"
+target_bot = "10000000000000004"
+
+# Use a distinct role and room first when testing beside the existing connection.
+bot_id = "ll-discord"
+alias = "ll-discord"
+room = 1

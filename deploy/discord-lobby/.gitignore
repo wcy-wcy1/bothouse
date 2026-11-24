@@ -1,0 +1,5 @@
+relay.toml
+*.dpapi
+*.sqlite3*
+*.log*
+__pycache__/
