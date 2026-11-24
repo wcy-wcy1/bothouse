@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from contextlib import closing
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -36,19 +37,31 @@ class API:
         self.headers = {"Authorization": f"{scheme} {token}"}
         self.proxy = proxy
 
-    async def call(self, method, path, **kwargs):
+    async def call(self, method, path, *, retry_transient=False, **kwargs):
         for attempt in range(4):
-            async with self.session.request(
-                method, self.base + path, headers=self.headers, proxy=self.proxy,
-                allow_redirects=False, **kwargs,
-            ) as response:
-                if response.status == 429 and attempt < 3:
-                    wait = float((await response.json()).get("retry_after", 1))
-                elif 200 <= response.status < 300:
-                    return await response.json() if response.status != 204 else None
-                else:
-                    raise APIError(f"{method} {path} returned HTTP {response.status}", response.status)
-            await asyncio.sleep(min(max(wait, 0.1), 120))
+            try:
+                async with self.session.request(
+                    method, self.base + path, headers=self.headers, proxy=self.proxy,
+                    allow_redirects=False, **kwargs,
+                ) as response:
+                    if 200 <= response.status < 300:
+                        return await response.json() if response.status != 204 else None
+                    error = APIError(f"{method} {path} returned HTTP {response.status}", response.status)
+                    if attempt == 3:
+                        raise error
+                    if response.status == 429:
+                        wait = float((await response.json()).get("retry_after", 1))
+                        if wait > 120:
+                            raise error
+                    elif retry_transient and response.status >= 500:
+                        wait = 2 ** attempt
+                    else:
+                        raise error
+            except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, TimeoutError):
+                if not retry_transient or attempt == 3:
+                    raise
+                wait = 2 ** attempt
+            await asyncio.sleep(max(wait, 0.1))
         raise AssertionError("unreachable")
 
 
@@ -120,6 +133,7 @@ class Relay:
         self.store.executescript("""
             CREATE TABLE IF NOT EXISTS sent (hub_id TEXT PRIMARY KEY, discord_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS rooms (channel TEXT PRIMARY KEY, room INTEGER UNIQUE, cursor TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS mirrored (discord_id TEXT PRIMARY KEY);
         """)
         self.rooms = {row[0]: row[1] for row in self.store.execute("SELECT channel, room FROM rooms")}
         mismatch = self.rooms.get(cfg["channel"]) not in (None, cfg["room"])
@@ -188,6 +202,8 @@ class Relay:
             await self.discover_rooms(text)
         link = f"https://discord.com/channels/{self.cfg['guild']}/{channel}/{message['id']}"
         await self.publish(ws, self.rooms[channel], reference, f"{text}\n\n[Discord]({link})")
+        with self.store:
+            self.store.execute("INSERT OR IGNORE INTO mirrored VALUES(?)", (message["id"],))
         self.seen[reference] = text
         if len(self.seen) > 1000:
             self.seen.pop(next(iter(self.seen)))
@@ -195,28 +211,33 @@ class Relay:
     async def poll(self, ws):
         while True:
             for channel in list(self.rooms):
-                cursor = self.store.execute("SELECT cursor FROM rooms WHERE channel=?", (channel,)).fetchone()[0]
-                path = f"/channels/{channel}/messages"
                 try:
-                    page = await self.discord.call("GET", path, params={"limit": 50})
+                    await self.poll_channel(ws, channel)
                 except APIError as exc:
                     if channel == self.cfg["channel"] or exc.status not in (403, 404):
                         raise
                     log.warning("Skipping unavailable Discord workspace %s", channel)
-                    continue
-                latest_id = max((int(m["id"]) for m in page), default=int(cursor))
-                pending = [page]
-                while len(page) == 50 and min(int(m["id"]) for m in page) > int(cursor) and cursor != "0":
-                    before = min((m["id"] for m in page), key=int)
-                    page = await self.discord.call("GET", path, params={"limit": 50, "before": before})
-                    pending.append(page)
-                for batch in reversed(pending):
-                    for message in sorted(batch, key=lambda m: int(m["id"])):
-                        if int(message["id"]) > int(cursor) or f"discord-{message['id']}" in self.seen:
-                            await self.mirror(ws, channel, message)
-                with self.store:
-                    self.store.execute("UPDATE rooms SET cursor=? WHERE channel=?", (str(latest_id), channel))
             await asyncio.sleep(5)
+
+    async def poll_channel(self, ws, channel):
+        cursor = int(self.store.execute("SELECT cursor FROM rooms WHERE channel=?", (channel,)).fetchone()[0])
+        path = f"/channels/{channel}/messages"
+        page = await self.discord.call("GET", path, params={"limit": 50})
+        latest_id = max(cursor, max((int(m["id"]) for m in page), default=0))
+        pending = [page]
+        while cursor and len(page) == 50 and min(int(m["id"]) for m in page) > cursor:
+            before = min((m["id"] for m in page), key=int)
+            page = await self.discord.call("GET", path, params={"limit": 50, "before": before})
+            pending.append(page)
+        for batch in reversed(pending):
+            for message in sorted(batch, key=lambda m: int(m["id"])):
+                message_id = message["id"]
+                if int(message_id) > cursor or self.store.execute(
+                    "SELECT 1 FROM mirrored WHERE discord_id=?", (message_id,),
+                ).fetchone():
+                    await self.mirror(ws, channel, message)
+        with self.store:
+            self.store.execute("UPDATE rooms SET cursor=? WHERE channel=?", (str(latest_id), channel))
 
     async def receive(self, ws):
         async for message in ws:
@@ -246,10 +267,17 @@ class Relay:
                 continue
             try:
                 payload = outbound_payload(frame, self.cfg["target_bot"])
-                sent = await self.discord.call("POST", f"/channels/{room}/messages", json=payload)
+                # Keep retries inside Discord's recent-message nonce deduplication window.
+                async with asyncio.timeout(45):
+                    sent = await self.discord.call(
+                        "POST", f"/channels/{room}/messages", json=payload, retry_transient=True,
+                    )
             except (ValueError, aiohttp.ClientError, TimeoutError, APIError) as exc:
                 detail = str(exc) if isinstance(exc, (ValueError, APIError)) else type(exc).__name__
-                await self.publish(ws, self.rooms[room], f"error-{frame['msg_id']}", f"Discord forwarding failed. {detail}")
+                notice = f"Discord forwarding failed. {detail}"
+                if not isinstance(exc, ValueError):
+                    notice += " Check the Discord channel for the request before resending."
+                await self.publish(ws, self.rooms[room], f"error-{frame['msg_id']}", notice)
                 continue
             with self.store:
                 self.store.execute("INSERT INTO sent VALUES(?, ?)", (frame["msg_id"], sent["id"]))
@@ -304,7 +332,7 @@ async def main(cfg, state, check):
         log.info("Verified Discord bot, channel history, and lobby room %s", cfg["room"])
         if not check:
             state.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(state) as database:
+            with closing(sqlite3.connect(state)) as database:
                 await Relay(cfg, discord, lobby, channel, database).run(session, hub["bot_token"])
 
 

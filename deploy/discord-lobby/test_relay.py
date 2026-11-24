@@ -3,6 +3,7 @@
 import asyncio
 import sqlite3
 import unittest
+from unittest.mock import AsyncMock
 
 import aiohttp
 from aiohttp import web
@@ -23,13 +24,14 @@ PARENT = "10000000000000006"
 class DiscordFixture:
     def __init__(self):
         self.sent = asyncio.Queue()
+        self.history = []
 
     async def call(self, method, path, **kwargs):
         if method == "POST" and path == f"/channels/{CHANNEL}/messages":
             await self.sent.put(kwargs["json"])
             return {"id": "10000000000000007"}
         if method == "GET" and path.endswith("/messages"):
-            return []
+            return self.history
         if method == "GET" and path == f"/channels/{WORKSPACE}":
             return {"guild_id": GUILD, "type": 0, "parent_id": PARENT, "name": "\u5de5\u4f5c\u533a1"}
         if method == "GET" and path == f"/channels/{UNEXPECTED}":
@@ -45,6 +47,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.server.close()
+        self.hub.db.close()
         self.database.close()
 
     async def test_forward_mirror_edit_and_discovery(self):
@@ -100,6 +103,53 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
     def test_outbound_respects_discord_character_limit(self):
         with self.assertRaisesRegex(ValueError, "2,000"):
             outbound_payload({"msg_id": "hub-1", "content": "\U0001f642" * 1000}, BOT)
+
+    async def test_discord_edit_is_mirrored_after_restart(self):
+        fixture = DiscordFixture()
+        cfg = {"guild": GUILD, "channel": CHANNEL, "target_bot": BOT, "room": 1}
+        relay = Relay(cfg, fixture, None, {"parent_id": PARENT}, self.database)
+        await relay.initialize()
+        relay.publish = AsyncMock()
+        message = {
+            "id": "10000000000000009", "author": {"id": BOT},
+            "content": "Task #42: working",
+        }
+        fixture.history = [message]
+        await relay.poll_channel(None, CHANNEL)
+        relay.publish.assert_awaited_once()
+
+        restarted = Relay(cfg, fixture, None, {"parent_id": PARENT}, self.database)
+        restarted.publish = AsyncMock()
+        message["content"] = "Task #42: returned"
+        await restarted.poll_channel(None, CHANNEL)
+        restarted.publish.assert_awaited_once()
+        self.assertIn("Task #42: returned", restarted.publish.await_args.args[-1])
+
+        fixture.history = [dict(message, id="10000000000000008")]
+        await restarted.poll_channel(None, CHANNEL)
+        self.assertEqual(restarted.publish.await_count, 1)
+        cursor = self.database.execute("SELECT cursor FROM rooms WHERE channel=?", (CHANNEL,)).fetchone()[0]
+        self.assertEqual(cursor, message["id"])
+
+    async def test_discord_retry_reuses_nonce(self):
+        requests = []
+
+        async def send(request):
+            requests.append(await request.json())
+            if len(requests) == 1:
+                return web.Response(status=502)
+            return web.json_response({"id": "10000000000000007"})
+
+        app = web.Application()
+        app.router.add_post("/messages", send)
+        async with TestServer(app) as server, aiohttp.ClientSession() as session:
+            base = str(server.make_url("/")).rstrip("/")
+            discord = API(session, base, "bot-test", "Bot")
+            payload = outbound_payload({"msg_id": "hub-1", "content": "example"}, BOT)
+            result = await discord.call("POST", "/messages", retry_transient=True, json=payload)
+        self.assertEqual(result["id"], "10000000000000007")
+        self.assertEqual(requests, [payload, payload])
+        self.assertTrue(payload["enforce_nonce"])
 
 
 if __name__ == "__main__":
