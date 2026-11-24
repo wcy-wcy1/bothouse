@@ -7,6 +7,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$StateDirectory = (Resolve-Path -LiteralPath $StateDirectory).ProviderPath
 $state = Get-Content -LiteralPath (Join-Path $StateDirectory 'hub.json') -Raw | ConvertFrom-Json
 if (!$state.web_token -or !$state.bot_token) {
     throw 'hub.json must contain both web_token and bot_token'
