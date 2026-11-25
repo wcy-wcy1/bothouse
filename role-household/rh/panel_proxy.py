@@ -10,11 +10,12 @@ import tomllib
 from pathlib import Path
 from urllib.parse import urlencode
 
-from aiohttp import ClientError, ClientSession, WSMsgType, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
 from .hub import is_web_authed, make_auth_gate_html, set_auth_cookie
 
 PANEL_PREFIX = "/collab/panel"
+GATE_ALLOWED_PATHS = {"decide", "context", "lead", "whoami", "memvote"}
 SAFE_REQUEST_HEADERS = {"accept", "accept-language", "content-type", "if-none-match", "if-modified-since", "range"}
 SAFE_RESPONSE_HEADERS = {
     "content-type", "cache-control", "etag", "last-modified",
@@ -237,6 +238,40 @@ def attach(app: web.Application, hub, config_path: str | Path | None = None) -> 
                 headers={"Cache-Control": "no-store"},
             )
 
+    gate_base = os.environ.get("RH_GATE_URL", "http://127.0.0.1:9930").rstrip("/")
+
+    async def gate_proxy(request: web.Request):
+        if not hub.bot_token_ok(request.match_info.get("bot_tok", "")):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        tail = request.match_info.get("tail", "").lstrip("/")
+        if tail not in GATE_ALLOWED_PATHS:
+            return web.json_response({"ok": False, "error": "not found"}, status=404)
+        if session is None:
+            return web.json_response({"ok": False, "error": "proxy session unavailable"}, status=502)
+        upstream_url = f"{gate_base}/{tail}"
+        if request.query_string:
+            upstream_url += "?" + request.query_string
+        headers = {}
+        if request.headers.get("Content-Type"):
+            headers["Content-Type"] = request.headers["Content-Type"]
+        body = await request.read() if request.method not in ("GET", "HEAD") else None
+        try:
+            async with session.request(
+                request.method,
+                upstream_url,
+                headers=headers,
+                data=body,
+                timeout=ClientTimeout(total=5.0),
+                allow_redirects=False,
+            ) as upstream:
+                payload = await upstream.read()
+                out_headers = {}
+                if upstream.headers.get("Content-Type"):
+                    out_headers["Content-Type"] = upstream.headers["Content-Type"]
+                return web.Response(body=payload, status=upstream.status, headers=out_headers)
+        except (ClientError, OSError, asyncio.TimeoutError):
+            return web.json_response({"ok": False, "error": "gate unreachable"}, status=502)
+
     async def startup(app: web.Application) -> None:
         nonlocal session
         session = ClientSession()
@@ -253,6 +288,7 @@ def attach(app: web.Application, hub, config_path: str | Path | None = None) -> 
     bcfg, _ = bridge_settings()
     if bcfg and bcfg["path"] != "/bridge/ws":
         app.router.add_get(bcfg["path"], bridge_ws)
+    app.router.add_route("*", "/gate/{bot_tok}/{tail:.*}", gate_proxy)
     app.router.add_get(PANEL_PREFIX, legacy)
     app.router.add_route("*", f"{PANEL_PREFIX}/", proxy)
     app.router.add_route("*", f"{PANEL_PREFIX}/{{tail:.*}}", proxy)

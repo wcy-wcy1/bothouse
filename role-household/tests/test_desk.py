@@ -75,9 +75,11 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
         self._prev_t3 = os.environ.get("RH_T3_STATE_DB")
         self._prev_panel = os.environ.get("RH_PANEL_CONFIG")
         self._prev_wiki = os.environ.get("RH_WIKI_DIR")
+        self._prev_gate = os.environ.get("RH_GATE_URL")
         os.environ["RH_T3_STATE_DB"] = str(self.t3_db)
         os.environ.pop("RH_PANEL_CONFIG", None)
         os.environ.pop("RH_WIKI_DIR", None)
+        os.environ.pop("RH_GATE_URL", None)
         self.hub = Hub(self.root / "hub.sqlite3", "test-token")
         self.app = make_app(self.hub)
         self.client = TestClient(TestServer(self.app))
@@ -98,6 +100,10 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
             os.environ.pop("RH_WIKI_DIR", None)
         else:
             os.environ["RH_WIKI_DIR"] = self._prev_wiki
+        if self._prev_gate is None:
+            os.environ.pop("RH_GATE_URL", None)
+        else:
+            os.environ["RH_GATE_URL"] = self._prev_gate
         self.temp.cleanup()
 
     async def test_cookie_auth_and_desk_routes(self):
@@ -454,6 +460,52 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
             resp = await self.client.get(f"/collab/avatars/{slug}.png", headers=headers)
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.headers.get("Content-Type"), "image/png")
+
+    async def test_gate_proxy(self):
+        captured = {}
+        upstream = web.Application()
+
+        async def whoami(request):
+            return web.json_response({"ok": True, "port": 9930})
+
+        async def decide(request):
+            captured["bot"] = request.query.get("bot")
+            captured["body"] = await request.json()
+            return web.json_response({"action": "context", "reason": "mock"})
+
+        async def context(request):
+            return web.json_response({"wiki": []})
+
+        upstream.router.add_get("/whoami", whoami)
+        upstream.router.add_post("/decide", decide)
+        upstream.router.add_post("/context", context)
+        server = TestServer(upstream)
+        await server.start_server()
+        try:
+            await self.client.close()
+            os.environ["RH_GATE_URL"] = f"http://127.0.0.1:{server.port}"
+            self.app = make_app(self.hub)
+            self.client = TestClient(TestServer(self.app))
+            await self.client.start_server()
+
+            bad_tok = await self.client.get("/gate/wrong-token/whoami")
+            self.assertEqual(bad_tok.status, 401)
+            bad_path = await self.client.get("/gate/test-token/forum")
+            self.assertEqual(bad_path.status, 404)
+            bad_trav = await self.client.get("/gate/test-token/../etc")
+            self.assertEqual(bad_trav.status, 404)
+
+            ok_who = await self.client.get("/gate/test-token/whoami")
+            self.assertEqual(ok_who.status, 200)
+            self.assertTrue((await ok_who.json())["ok"])
+
+            ok_dec = await self.client.post("/gate/test-token/decide?bot=codex", json={"content": "hi"})
+            self.assertEqual(ok_dec.status, 200)
+            self.assertEqual((await ok_dec.json())["action"], "context")
+            self.assertEqual(captured["bot"], "codex")
+            self.assertEqual(captured["body"], {"content": "hi"})
+        finally:
+            await server.close()
 
 
 if __name__ == "__main__":

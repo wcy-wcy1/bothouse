@@ -81,6 +81,7 @@ Test-NetConnection '<LOCAL_TAILSCALE_IP>' -Port 8790
   - 像素办公室 `/collab/desk` 同时实时呈现大厅 Bot（如 `remote-ll`、`local-codex`）与 T3 Code 只读状态库（`t3-antigravity` 主控与 `t3-codex` 子代理委派/完成光束及回放）。
   - 知识星河 `/collab/wiki-galaxy`（数据源 `/collab/api/wiki-galaxy`）直接扫描 `RH_WIKI_DIR`（默认 `<state_parent>/wiki`）渲染 Markdown 图谱。
   - **团队调度模式**：聊天大厅顶部栏提供 `单兵` / `混合` / `团队` 三档模式切换（支持工作区继承主频道配置），也可发送 `/solo`、`/mixed`、`/team` 持久切换，或用 `/team <任务>` / `团队模式：<任务>` 单轮强制触发团队协作。
+  - **智能闸门（Gate）分流（可选）**：当本机启用 Bothouse `gate`（配合本机 Ollama / JEV 模型）且仅在 `cloud_web` 平台开启 `group_reply_all = true`（`discord` 保持 `false` 隔离）时，可通过 `[projects].gate_url` 接入智能判断；远端主角色可直接通过 `rh.hub` 在 Tailnet 8790 提供的鉴权反向代理 `http://<LOCAL_TAILSCALE_IP>:8790/gate/<BOT_TOKEN>/decide` 共用同一个本地 Gate，实现不 `@` 自动选人接话与打断/插话控制。
 
 ## 验证
 
