@@ -140,7 +140,17 @@ function syncAuthCookie() {
   const syncing = token;
   cookieSyncedToken = syncing;
   fetch("/api/auth/cookie", {method: "POST", credentials: "same-origin", headers: {"Authorization": "Bearer " + syncing}})
-    .then((r) => { if (!r.ok && cookieSyncedToken === syncing) cookieSyncedToken = null; })
+    .then((r) => {
+      if (r.ok) {
+        document.querySelectorAll("img.face[data-av-retry]").forEach((img) => {
+          img.removeAttribute("data-av-retry");
+          img.style.display = "";
+          img.src = img.dataset.src;
+        });
+      } else if (cookieSyncedToken === syncing) {
+        cookieSyncedToken = null;
+      }
+    })
     .catch(() => { if (cookieSyncedToken === syncing) cookieSyncedToken = null; });
 }
 

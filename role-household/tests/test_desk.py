@@ -443,6 +443,18 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await server.close()
 
+    async def test_hub_builtin_avatars(self):
+        headers = {"Authorization": "Bearer test-token"}
+        home = await self.client.get("/", headers=headers)
+        self.assertEqual(home.status, 200)
+        html = await home.text()
+        self.assertIn("BUILTIN_AVATAR_RULES", html)
+        self.assertIn("/collab/avatars/", html)
+        for slug in ("orange", "dragon", "whale", "rainbow", "grok", "lanxi"):
+            resp = await self.client.get(f"/collab/avatars/{slug}.png", headers=headers)
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.headers.get("Content-Type"), "image/png")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,6 +67,7 @@
   .av { width:40px; height:40px; border-radius:50%; flex:none; overflow:hidden; display:flex; align-items:center; justify-content:center;
         color:#fff; font-weight:600; font-size:16px; position:relative; }
   .av img { width:100%; height:100%; object-fit:cover; display:block; }
+  .av img.face { position:absolute; inset:0; }
   .av.sm { width:32px; height:32px; font-size:14px; }
   /* ---- 中间消息区 ---- */
   #main { flex:1; min-width:0; display:flex; flex-direction:column; background:var(--chat); }
@@ -457,13 +458,31 @@ const colorOf = () => {
   for (const b of bots) { const t = twinOf(b.id); c[b.id] = t ? c[t.id] : COLORS[n++ % COLORS.length]; }
   return c;
 };
-const okAvatar = (a) => a && a.startsWith("data:image/");
-
+const okAvatar = (a) => a && (a.startsWith("data:image/") || a.startsWith("/collab/avatars/"));
+const BUILTIN_AVATAR_RULES = [
+  ["orange", /^(?:remote-ll|ju|maomao|ll-cc1)$/i, /小橘|橘|maomao/i],
+  ["dragon", /^(?:local-codex|codex|discord-codex|longniang)$/i, /龙娘|codex|gpt/i],
+  ["whale", /^(?:jingyu|whale|t3-codex)$/i, /鲸鱼|deepseek/i],
+  ["rainbow", /^(?:caihongmao|rainbow|t3-antigravity)$/i, /彩虹猫|gemini|主控/i],
+  ["grok", /^(?:grok|raven)$/i, /渡鸦|grok/i],
+  ["lanxi", /^(?:lanxi|minimax)$/i, /岚汐|minimax/i],
+];
+function builtinAvatar(id, name) {
+  const sid = String(id || "").trim(), sname = String(name || "").trim();
+  for (const [slug, idRe, nameRe] of BUILTIN_AVATAR_RULES) {
+    if (idRe.test(sid) || (sname && nameRe.test(sname))) return `/collab/avatars/${slug}.png`;
+  }
+  return "";
+}
 function avatarHTML(id, name, color, small) {
-  const m = members.find(x => x.id === id) || twinOf(id);
-  if (m && okAvatar(m.avatar)) return `<div class="av${small ? " sm" : ""}"><img class="face" alt="" src="${esc(m.avatar)}"></div>`;
   if (id === "user") return `<div class="av${small ? " sm" : ""}" style="background:var(--blurple)">你</div>`;
-  return `<div class="av${small ? " sm" : ""}" style="background:${color || "#5c5e66"}">${esc((name || "?")[0])}</div>`;
+  const m = members.find(x => x.id === id) || twinOf(id);
+  const src = (m && okAvatar(m.avatar)) ? m.avatar : builtinAvatar(id, name || (m && m.name));
+  const ch = esc((name || "?")[0]);
+  if (src) {
+    return `<div class="av${small ? " sm" : ""}" style="background:${color || "#5c5e66"}"><span>${ch}</span><img class="face" alt="" data-src="${esc(src)}" src="${esc(src)}" onerror="this.dataset.avRetry='1';this.style.display='none'"></div>`;
+  }
+  return `<div class="av${small ? " sm" : ""}" style="background:${color || "#5c5e66"}">${ch}</div>`;
 }
 
 let volDragging = false;   // 正在拖音量滑条时不重画成员栏（重画会把拖着的滑条换掉）
