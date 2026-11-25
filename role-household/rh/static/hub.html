@@ -302,6 +302,19 @@
     .msg { -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }   /* 长按出菜单，不去选字 */
     .msg:hover { background:none; }
   }
+#dmode{display:inline-flex;align-items:center;gap:2px;margin-left:8px;padding:2px;border-radius:8px;background:rgba(128,128,128,.14);border:1px solid rgba(128,128,128,.24);flex:0 0 auto}
+#dmode button{all:unset;padding:3px 9px;border-radius:6px;font-size:12px;color:var(--sub,var(--m,#94a3b8));cursor:pointer;line-height:1.4;transition:background .12s,color .12s}
+#dmode button:hover{color:var(--head,var(--tx,inherit));background:rgba(128,128,128,.16)}
+#dmode button.on{background:#5865f2;color:#fff;font-weight:600}
+#dmode button[data-mode="team"].on{background:#e67e22;color:#fff}
+#dmode button[data-mode="solo"].on{background:#4f545c;color:#fff}
+.ch .mb{font-size:10px;line-height:1;padding:2px 4px;border-radius:4px;margin-left:4px;font-weight:600;flex:0 0 auto}
+.ch .mb.team{background:rgba(230,126,34,.18);color:#f39c12}
+.ch .mb.solo{background:rgba(148,163,184,.18);color:var(--sub,var(--m,#94a3b8))}
+.cat.ws-hdr{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
+.cat.ws-hdr:hover{color:var(--head,var(--tx,inherit))}
+.ws-tog{all:unset;font-size:11px;color:var(--sub,var(--m,#94a3b8));cursor:pointer;padding:2px 4px}
+@media (max-width:900px){#dmode{margin-left:4px}#dmode button{padding:2px 6px;font-size:11px}.topic{display:none}}
 </style>
 </head>
 <body>
@@ -326,7 +339,7 @@
   </div>
 </aside>
 <div id="main">
-  <div class="top"><button class="tb" id="open-left" type="button" aria-label="频道">☰</button><span class="hash">#</span><span id="room">频道</span><span class="topic">@ 谁就叫谁回话</span>
+  <div class="top"><button class="tb" id="open-left" type="button" aria-label="频道">☰</button><span class="hash">#</span><span id="room">频道</span><div id="dmode" role="group" aria-label="调度模式"><button type="button" data-mode="solo" title="单兵模式：仅 @ 谁就叫谁回话">单兵</button><button type="button" data-mode="mixed" title="混合模式：常规直答，复杂自动触发团队">混合</button><button type="button" data-mode="team" title="团队模式：小橘自动统筹团队协作">团队</button></div><span class="topic">@ 谁就叫谁回话</span>
     <input id="q" type="search" placeholder="搜索" aria-label="搜索消息" autocomplete="off">
     <span id="topctl"><span id="conn" title="连接中…"></span><button class="tb" id="open-search" type="button" aria-label="搜索">🔍</button><button class="tb" id="open-right" type="button" aria-label="成员">👥</button></span></div>
   <div id="banner" role="status" hidden></div>
@@ -498,27 +511,76 @@ function renderMembers() {
 // ---- 左栏频道列表（rh/hub.py「多频道」）。默认频道（id 最小）不能删；删除 = 归档，进「已归档」，能打开看、能恢复。
 // 频道名最长 64 字：来源 rh/hub.py MAX_NAME（hub 按它拒收，输入框 maxlength 同它）。
 let renaming = null;   // 正在改名的频道 id：改名时不重画列表（重画会把输入框换掉）
+let wsOpen = false;    // 左侧工作区默认折叠，当前位于工作区内或手动展开时显示
 // 当前频道归档了没有：归档的只读（不能发、改、删）
 const roomArchived = () => { const me = rooms.find(r => r.id === room); return !!(me && me.archived_at != null); };
+function effectiveRoom(id = room) {
+  const cur = rooms.find(r => r.id === id);
+  if (!cur) return null;
+  if (cur.kind === "workspace" && cur.parent_id != null) {
+    return rooms.find(r => r.id === cur.parent_id) || cur;
+  }
+  return cur;
+}
+function activeDispatchMode(id = room) {
+  const eff = effectiveRoom(id);
+  const dm = eff && eff.dispatch_mode;
+  return dm === "solo" || dm === "mixed" || dm === "team" ? dm : "mixed";
+}
+function renderModeBar() {
+  const dm = activeDispatchMode();
+  $("dmode").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.mode === dm));
+  const topic = document.querySelector("#main .top .topic");
+  if (topic) {
+    topic.textContent = dm === "team" ? "团队模式 · 小橘主控统筹（可直接派活，或 /solo 切回）"
+      : dm === "solo" ? "单兵模式 · 仅 @ 谁就叫谁回话（/team 触发团队）"
+      : "混合模式 · @ 谁回话，复杂任务自动协作（/team 任务 可单轮强开）";
+  }
+}
 function renderRooms() {
   if (renaming != null) return;
   const first = Math.min(...rooms.map(r => r.id));
   const row = (r) => {
     const acts = r.archived_at != null ? `<button class="restore" title="恢复频道">↺</button>`
       : `<button class="rename" title="改名">✎</button>` + (r.id === first ? "" : `<button class="archive" title="删除频道（消息留着，可恢复）">×</button>`);
-    return `<div class="ch${r.id === room ? " on" : ""}${r.archived_at != null ? " archived" : ""}" data-id="${r.id}">
-      <span class="hash">#</span><span class="nm">${esc(r.name)}</span><span class="acts">${acts}</span></div>`;
+    const dm = r.kind === "workspace" ? "" : (r.dispatch_mode || "");
+    const badge = dm === "team" ? `<span class="mb team" title="团队模式">团</span>`
+      : dm === "solo" ? `<span class="mb solo" title="单兵模式">单</span>` : "";
+    return `<div class="ch${r.id === room ? " on" : ""}${r.archived_at != null ? " archived" : ""}${r.kind === "workspace" ? " ws" : ""}" data-id="${r.id}">
+      <span class="hash">#</span><span class="nm">${esc(r.name)}</span>${badge}<span class="acts">${acts}</span></div>`;
   };
   const live = rooms.filter(r => r.archived_at == null), gone = rooms.filter(r => r.archived_at != null);
-  $("roomlist").innerHTML = live.map(row).join("") +
+  const chats = live.filter(r => r.kind !== "workspace");
+  const wss = live.filter(r => r.kind === "workspace");
+  const inWs = wss.some(r => r.id === room);
+  const showWs = wsOpen || inWs;
+  const wsHtml = wss.length
+    ? `<div class="cat gap ws-hdr ws-tog"><span>工作区 (${wss.length})</span><button type="button" class="ws-tog" title="展开/收起工作区">${showWs ? "▾" : "▸"}</button></div>`
+      + (showWs ? wss.map(row).join("") : "")
+    : "";
+  $("roomlist").innerHTML = chats.map(row).join("") + wsHtml +
     (gone.length ? `<div class="cat gap">已归档</div>` + gone.map(row).join("") : "");
   const archived = roomArchived();
   if (archived && editing) stopEdit();   // 正在改的那条所在频道被归档了
+  renderModeBar();
   $("in").disabled = archived;
   $("in").placeholder = archived ? "频道已归档，点左边 ↺ 恢复后才能发消息" : inputHint(roomName);
 }
+$("dmode").addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-mode]"); if (!b || room == null) return;
+  const target = effectiveRoom(room);
+  const {err} = await setRoomMode(target ? target.id : room, b.dataset.mode);
+  $("err").textContent = err || "";
+});
+$("roomlist").addEventListener("click", (e) => {
+  if (e.target.closest(".ws-tog")) { wsOpen = !wsOpen; renderRooms(); }
+});
 // 输入框占位。上面 <textarea id="in"> 里写死的是还没连上时（没有频道名）的这句，首屏不闪旧文案
-function inputHint(name) { return `给 #${name || "频道"} 发消息，@ 谁就叫谁回话`; }
+function inputHint(name) {
+  const dm = activeDispatchMode();
+  if (dm === "team") return `给 #${name || "频道"} 发消息（团队模式，直接派活给小橘团队；/solo 切回）`;
+  return `给 #${name || "频道"} 发消息（@ 谁就叫谁回话，或 /team 任务 单轮强制团队）`;
+}
 $("newroom").onclick = () => { $("newrow").classList.toggle("open"); $("roomname").focus(); };
 $("roomname").onkeydown = async (e) => {
   if (e.key === "Escape") { $("newrow").classList.remove("open"); return; }

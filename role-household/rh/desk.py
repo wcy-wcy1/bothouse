@@ -15,6 +15,118 @@ from aiohttp import web
 
 from .hub import STATIC, is_web_authed, make_auth_gate_html, set_auth_cookie
 
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
+MDLINK_RE = re.compile(r"\[[^\]]*\]\(([^)#\s]+\.md)(?:#[^)\s]+)?\)", re.I)
+TAG_RE = re.compile(r"(?:^|\s)#([A-Za-z0-9_\-\u4e00-\u9fa5]{1,32})")
+
+
+def _parse_frontmatter(raw: str) -> tuple[dict[str, str], str]:
+    lines = raw.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, raw
+    meta: dict[str, str] = {}
+    end_idx = None
+    for idx in range(1, min(len(lines), 40)):
+        line = lines[idx].strip()
+        if line == "---":
+            end_idx = idx
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip().lower()] = v.strip().strip("\"'")
+    if end_idx is None:
+        return {}, raw
+    return meta, "\n".join(lines[end_idx + 1:])
+
+
+def _resolve_wiki_link(src_id: str, raw_target: str, by_id: dict[str, dict], by_stem: dict[str, list[str]]) -> str | None:
+    tgt = raw_target.strip().replace("\\", "/")
+    if not tgt:
+        return None
+    if tgt.startswith("./") or tgt.startswith("../"):
+        parent = Path(src_id).parent
+        rel = os.path.normpath((parent / tgt).as_posix()).replace("\\", "/")
+        tgt = rel.lstrip("/")
+    cands = [tgt, f"{tgt}.md", tgt.rstrip("/") + "/README.md"]
+    for c in cands:
+        if c in by_id:
+            return c
+        low = c.lower()
+        for existing in by_id:
+            if existing.lower() == low:
+                return existing
+    stem = Path(tgt).stem.lower()
+    hits = by_stem.get(stem, [])
+    return hits[0] if len(hits) == 1 else None
+
+
+def scan_wiki(root: Path | None) -> dict:
+    """Scan Markdown wiki pages under root into Wiki Galaxy graph payload."""
+    if root is None or not root.is_dir():
+        return {"nodes": [], "links": [], "groups": {}}
+    files = sorted(
+        p for p in root.rglob("*.md")
+        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts)
+    )
+    nodes: list[dict] = []
+    by_id: dict[str, dict] = {}
+    by_stem: dict[str, list[str]] = {}
+    raw_links: list[tuple[str, str]] = []
+    groups: dict[str, int] = {}
+    for p in files:
+        rel = p.relative_to(root)
+        rel_id = rel.as_posix()
+        parts = rel.parts
+        group = parts[0] if len(parts) > 1 else ""
+        cluster = "/".join(parts[:-1])
+        try:
+            text = p.read_text("utf-8", errors="replace")
+        except OSError:
+            continue
+        meta, body = _parse_frontmatter(text)
+        body_lines = body.splitlines()
+        title = meta.get("title", "")
+        excerpt_lines: list[str] = []
+        for line in body_lines:
+            s = line.strip()
+            if not title and s.startswith("# "):
+                title = s[2:].strip()
+                continue
+            if not s or s.startswith("#"):
+                continue
+            excerpt_lines.append(line.rstrip())
+            if len("\n".join(excerpt_lines)) >= 220 or len(excerpt_lines) >= 5:
+                break
+        node = {
+            "id": rel_id,
+            "title": title or rel.stem,
+            "group": group,
+            "cluster": cluster,
+            "description": meta.get("description", ""),
+            "excerpt": "\n".join(excerpt_lines)[:220],
+            "lines": len(text.splitlines()),
+        }
+        nodes.append(node)
+        by_id[rel_id] = node
+        by_stem.setdefault(rel.stem.lower(), []).append(rel_id)
+        groups[group] = groups.get(group, 0) + 1
+        for m in WIKILINK_RE.finditer(text):
+            raw_links.append((rel_id, m.group(1)))
+        for m in MDLINK_RE.finditer(text):
+            raw_links.append((rel_id, m.group(1)))
+    seen_edges: set[tuple[str, str]] = set()
+    links: list[dict] = []
+    for src, tgt in raw_links:
+        resolved = _resolve_wiki_link(src, tgt, by_id, by_stem)
+        if not resolved or resolved == src:
+            continue
+        edge = (min(src, resolved), max(src, resolved))
+        if edge in seen_edges:
+            continue
+        seen_edges.add(edge)
+        links.append({"source": src, "target": resolved})
+    return {"nodes": nodes, "links": links, "groups": groups}
+
 NOTICE_PREFIXES = ("📬", "✅", "↪", "⏳", "🔄", "⏹", "⏸")
 FENCE_RE = re.compile(r"```.*?```", re.S)
 FOOTER_RE = re.compile(r"(?:^|\n+)\*[^*\n]*·[^*]*\*\s*$", re.S)
@@ -83,9 +195,17 @@ def _terminal_kind(status: str) -> str:
 
 
 def attach(app: web.Application, hub, t3_db_path: str | Path | None = None,
-           names_path: str | Path | None = None) -> None:
+           names_path: str | Path | None = None, wiki_dir: str | Path | None = None) -> None:
     raw_t3 = t3_db_path if t3_db_path is not None else os.environ.get("RH_T3_STATE_DB")
     t3_path = Path(raw_t3) if raw_t3 else None
+    raw_wiki = wiki_dir if wiki_dir is not None else os.environ.get("RH_WIKI_DIR")
+    if raw_wiki:
+        wiki_root: Path | None = Path(raw_wiki)
+    elif getattr(hub, "db_path", None):
+        cand = hub.db_path.parent.parent / "wiki"
+        wiki_root = cand if cand.is_dir() else None
+    else:
+        wiki_root = None
     name_file = Path(names_path) if names_path is not None else (
         hub.db_path.parent / "desk-names.json" if getattr(hub, "db_path", None) else None
     )
@@ -159,7 +279,31 @@ def attach(app: web.Application, hub, t3_db_path: str | Path | None = None,
         path = STATIC / "collab-avatars" / name
         return web.FileResponse(path) if path.is_file() else web.Response(status=404)
 
+    def room_snapshot() -> list[dict]:
+        out = []
+        for r in hub.rooms():
+            mode, explicit = hub.effective_dispatch_setting(r["id"])
+            out.append({
+                "id": f"room-{r['id']}",
+                "name": r["name"],
+                "kind": r.get("kind", "chat"),
+                "parent_id": f"room-{r['parent_id']}" if r.get("parent_id") is not None else None,
+                "dispatch_mode": mode or "mixed",
+                "dispatch_explicit": explicit,
+            })
+        return out
+
+    async def collab_root(request: web.Request):
+        raise web.HTTPFound("/")
+
     async def wiki(request: web.Request):
+        token = request.query.get("token")
+        if token and hub.token_ok(token):
+            query = [(k, v) for k, v in request.query.items() if k != "token"]
+            location = request.path + (("?" + urlencode(query)) if query else "")
+            response = web.HTTPFound(location=location)
+            set_auth_cookie(response, hub, request)
+            raise response
         if not is_web_authed(hub, request):
             return web.Response(
                 text=make_auth_gate_html(request.path_qs),
@@ -167,12 +311,16 @@ def attach(app: web.Application, hub, t3_db_path: str | Path | None = None,
                 content_type="text/html",
                 headers={"Cache-Control": "no-store"},
             )
-        raise web.HTTPFound("/collab/panel/wiki-galaxy")
+        return web.FileResponse(STATIC / "wiki-galaxy.html", headers={"Cache-Control": "no-store"})
+
+    @auth
+    async def wiki_data(request: web.Request):
+        return web.json_response(scan_wiki(wiki_root))
 
     @auth
     async def state(request: web.Request):
         members = roster()
-        rooms = [{"id": f"room-{r['id']}", "name": r["name"]} for r in hub.rooms()]
+        rooms = room_snapshot()
         rooms_thinking = {f"room-{rid}": list(bots) for rid, bots in hub.bot_thinking.items() if bots}
         if thinking:
             rooms_thinking["t3"] = list(thinking)
@@ -473,12 +621,16 @@ def attach(app: web.Application, hub, t3_db_path: str | Path | None = None,
     async def lobby_bots() -> None:
         emit({"type": "members", "members": roster()})
 
+    async def lobby_rooms() -> None:
+        emit({"type": "rooms", "rooms": room_snapshot(), "ts": _iso_of()})
+
     async def lobby_thinking(room_id: int, bots: list[str]) -> None:
         emit({"type": "thinking", "room_id": f"room-{room_id}", "members": list(bots), "ts": _iso_of()})
 
     hub.listeners.append(lobby_message)
     hub.bot_listeners.append(lobby_bots)
     hub.thinking_listeners.append(lobby_thinking)
+    hub.room_listeners.append(lobby_rooms)
 
     async def startup(app: web.Application) -> None:
         nonlocal polling
@@ -494,6 +646,7 @@ def attach(app: web.Application, hub, t3_db_path: str | Path | None = None,
             (hub.listeners, lobby_message),
             (hub.bot_listeners, lobby_bots),
             (hub.thinking_listeners, lobby_thinking),
+            (hub.room_listeners, lobby_rooms),
         ):
             if callback in listeners:
                 listeners.remove(callback)
@@ -504,9 +657,11 @@ def attach(app: web.Application, hub, t3_db_path: str | Path | None = None,
     app.on_startup.append(startup)
     app.on_shutdown.append(shutdown)
     app.on_cleanup.append(cleanup)
+    app.router.add_get("/collab", collab_root)
     app.router.add_get("/collab/desk", desk_page)
     app.router.add_get("/collab/avatars/{name}", avatar)
     app.router.add_get("/collab/wiki-galaxy", wiki)
+    app.router.add_get("/collab/api/wiki-galaxy", wiki_data)
     app.router.add_get("/collab/api/state", state)
     app.router.add_get("/collab/api/desk/state", task_state)
     app.router.add_get("/collab/api/desk/replay", replay)

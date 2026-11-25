@@ -62,8 +62,8 @@ Test-NetConnection '<LOCAL_TAILSCALE_IP>' -Port 8790
 
 `role-household` 现已内置 **T3 Code × Bothouse 像素办公室（`/collab/desk`）** 与 **Bothouse Web 管理面板反向代理（`/collab/panel/`）**，桌面端、T3 Preview 与 iPhone PWA 均可复用现有的 `443` Tailscale Serve 入口与 Cookie 登录态，无需新增 Tailnet 端口或 ACL 规则：
 
-1. 本机配置启用管理面板后重启 Bothouse（详见 `local-codex-cloud-web.toml.example` 末尾注释中的 `[management]` 节，建议绑定 `127.0.0.1:9820` 并使用随机管理 token）。
-2. 启动 Hub 时传入 `-T3StateDb`、`-PanelConfig` 与可选 `-LogFile`：
+1. 本机配置启用管理面板与 Bridge 后重启 Bothouse（详见 `local-codex-cloud-web.toml.example` 末尾注释中的 `[management]` 与 `[bridge]` 节；建议绑定回环端口并分别配置随机 token，`rh.hub` 通过 `/bridge/ws` 反向代理面板的实时对话 WebSocket）。
+2. 启动 Hub 时传入 `-T3StateDb`、`-PanelConfig`、可选 `-WikiDir` 与可选 `-LogFile`：
 
 ~~~powershell
 .\deploy\windows-team\Start-Lobby.ps1 `
@@ -71,6 +71,7 @@ Test-NetConnection '<LOCAL_TAILSCALE_IP>' -Port 8790
     -UserMentionId '<USER_DISCORD_ID>' `
     -T3StateDb '<T3CODE_STATE_DB>' `
     -PanelConfig '<BOTHOUSE_CONFIG_TOML>' `
+    -WikiDir (Join-Path $env:USERPROFILE '.bothouse/wiki') `
     -LogFile (Join-Path $env:USERPROFILE '.bothouse/hub/hub.log')
 ~~~
 
@@ -78,6 +79,8 @@ Test-NetConnection '<LOCAL_TAILSCALE_IP>' -Port 8790
 - **统一入口**：
   - 聊天大厅 `/` 左侧服务器栏新增 **`办`**（`/collab/desk`）与 **`管`**（`/collab/panel/`），登录聊天大厅时自动同步 `HttpOnly` Cookie（`rh_auth`）。
   - 像素办公室 `/collab/desk` 同时实时呈现大厅 Bot（如 `remote-ll`、`local-codex`）与 T3 Code 只读状态库（`t3-antigravity` 主控与 `t3-codex` 子代理委派/完成光束及回放）。
+  - 知识星河 `/collab/wiki-galaxy`（数据源 `/collab/api/wiki-galaxy`）直接扫描 `RH_WIKI_DIR`（默认 `<state_parent>/wiki`）渲染 Markdown 图谱。
+  - **团队调度模式**：聊天大厅顶部栏提供 `单兵` / `混合` / `团队` 三档模式切换（支持工作区继承主频道配置），也可发送 `/solo`、`/mixed`、`/team` 持久切换，或用 `/team <任务>` / `团队模式：<任务>` 单轮强制触发团队协作。
 
 ## 验证
 

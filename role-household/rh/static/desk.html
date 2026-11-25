@@ -1564,7 +1564,9 @@ function paintAll(animate = false) {
 
 function updateStats() {
   const online = S.memberList.filter(m => m.online !== false).length;
-  $('stats').textContent = `在线 ${online}/${S.memberList.length} · 进行中 ${activeCount()}`;
+  const teams = (S.rooms || []).filter(r => r.kind !== 'workspace' && r.dispatch_mode === 'team');
+  const teamTag = teams.length ? ` · 团队:${teams.map(r => r.name).join(',')}` : '';
+  $('stats').textContent = `在线 ${online}/${S.memberList.length} · 进行中 ${activeCount()}${teamTag}`;
 }
 
 function setEmpty() {
@@ -1868,6 +1870,7 @@ function applyEvent(ev, animate = true) {
   else if (ev.type === 'thinking') applyThinking(ev);
   else if (ev.type === 'message') applyMessage(ev, animate);
   else if (ev.type === 'members') setMembers(ev.members);
+  else if (ev.type === 'rooms') { S.rooms = ev.rooms ?? []; updateStats(); }
   else if (ev.type === 'lead') setLead(ev.effective_lead_id ?? ev.lead_id);
 }
 S.logLimit = S.logLimit || 80;
@@ -1896,11 +1899,13 @@ function disconnectLive() {
 async function loadState() {
   const [state] = await Promise.all([api(ROOT + '/collab/api/state'), loadNames()]);
   S.me = state.me ?? null;
+  S.rooms = state.rooms ?? [];
   indexMembers(state.members ?? []);
   const lead = state.effective_lead_id ?? state.lead_id ?? null;
   S.lead = lead && S.byId.has(lead) ? lead : null;
   setThinkingRooms(state.thinking ?? {});
   renderSeats();
+  updateStats();
 }
 
 // 刷新/第一次打开时进行中的任务要从板上补回来，否则工位和「进行中」要等下一个事件才对。

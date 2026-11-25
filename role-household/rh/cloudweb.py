@@ -65,7 +65,7 @@ WS_PATH = "/cloud-web/ws"
 # team_workspace（#597 G1）：桥向 hub 要工作区（list/create/claim/release），帧照 conest
 # bridge/core/dsh_bundle/collab/cloudweb.mjs teamWorkspace、bridge/platform/cloud-web/protocol.go。
 CAPABILITIES = ["text", "reconstruct_reply", "typing", "preview", "update_message", "delete_message", "subtask_table",
-                "team_workspace"]
+                "team_workspace", "dispatch_mode"]
 REGISTER_TIMEOUT = 10.0  # 连上后多少秒内要发 register。来源：沿用 hub.py HELLO_TIMEOUT。
 HEARTBEAT = 30.0  # 来源：沿用 hub.py HEARTBEAT。
 WS_BAD_REGISTER = 4002  # 来源：沿用 hub.py WS_BAD_HELLO（RFC 6455 应用自定义关闭码段）。
@@ -383,18 +383,25 @@ class CloudWeb:
         room = self.hub.room(msg["room_id"])
         author = self.bots.get(msg["author"]) if from_bot else None
         mentioned = self.mentions(text)
+        one_shot = (not from_bot) and self.hub.is_one_shot_team_msg(text)
+        eff_mode, _ = self.hub.effective_dispatch_setting(msg["room_id"])
+        auto_target = None
+        if not from_bot and not target and not mentioned and (one_shot or eff_mode == "team"):
+            auto_target = "remote-ll" if "remote-ll" in self.bots else (next(iter(self.bots)) if one_shot and self.bots else None)
         sends = []
         for b in list(self.bots.values()):
             if (target and target != b.id) or (from_bot and msg["author"] == b.id):
                 continue
             content = self.for_bot(text, b)
-            hit = target == b.id or b.id in mentioned or (from_bot and self.name_called(text, b.name))
+            hit = target == b.id or b.id in mentioned or auto_target == b.id or (from_bot and self.name_called(text, b.name))
             if from_bot and not content:
                 continue   # 队友只发了个 @：同 Discord 丢掉，不空开一轮（复审第 3 条）
             if from_bot:
                 content = f"【{msg['name']}】{content}"
             elif hit and not content:
                 content = BARE_MENTION
+            elif auto_target == b.id and not one_shot and not self.hub.is_one_shot_team_msg(content):
+                content = f"[团队模式] {content}"
             frame = self._frame(msg, room, content, hit, from_bot)
             if author is not None and author.mention_id:
                 frame["user_mention_id"] = author.mention_id   # 认主角色派的活，同 Discord 作者 ID（conest cloud-web lead_return.go）
@@ -431,7 +438,8 @@ class CloudWeb:
     # ---------- bot → hub ----------
     def _room(self, d: dict) -> int | None:
         sk = d.get("session_key")
-        for raw in (d.get("reply_ctx"), sk.split(":")[1] if isinstance(sk, str) and sk.count(":") >= 1 else None):
+        for raw in (d.get("reply_ctx"), d.get("chat_id"),
+                    sk.split(":")[1] if isinstance(sk, str) and sk.count(":") >= 1 else None):
             if isinstance(raw, str) and raw.startswith("room-"):
                 raw = raw[len("room-"):]
             if isinstance(raw, str) and raw.isascii() and raw.isdigit() and self.hub.room(int(raw)) is not None:
@@ -469,8 +477,8 @@ class CloudWeb:
                 await self.hub.broadcast({"type": "message", "message": msg}, msg["room_id"])
 
     async def team_workspace(self, d: dict) -> dict:
-        """回一个 team_workspace 帧：op list | create | claim | release（带 park 也当 release，rh 没有任务表）。
-        照 collab/cloudweb.mjs teamWorkspace；dispatch_mode 不支持。建好、认领、放回后推一次频道列表给网页。"""
+        """回一个 team_workspace 帧：op dispatch_mode | list | create | claim | release（带 park 也当 release，rh 没有任务表）。
+        建好、认领、放回后推一次频道列表给网页。"""
         hub = self.hub
         rid = self._room(d)
         if rid is None:
@@ -480,7 +488,8 @@ class CloudWeb:
         op = d.get("op")
         try:
             if op == "dispatch_mode":
-                return {"ok": False, "error": "unsupported"}
+                mode, explicit = hub.effective_dispatch_setting(rid)
+                return {"ok": True, "dispatch_mode": mode, "dispatch_explicit": explicit}
             if op == "list":
                 rooms = []
                 for w in hub.workspaces():

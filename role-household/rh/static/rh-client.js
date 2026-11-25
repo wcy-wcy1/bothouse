@@ -315,6 +315,7 @@ async function roomApi(method, path, body) {
 }
 const createRoom = (name) => roomApi("POST", "/api/rooms", {name});
 const renameRoom = (id, name) => roomApi("PATCH", `/api/rooms/${id}`, {name});
+const setRoomMode = (id, dispatch_mode) => roomApi("PATCH", `/api/rooms/${id}`, {dispatch_mode});
 const archiveRoom = (id) => roomApi("DELETE", `/api/rooms/${id}`);   // 删除 = 归档，消息留着
 const restoreRoom = (id) => roomApi("PATCH", `/api/rooms/${id}`, {archived: false});
 

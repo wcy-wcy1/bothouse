@@ -26,4 +26,11 @@ team_lead_bot = "<LEAD_MENTION_ID>"
 # host = "127.0.0.1"
 # port = 9820
 # token = "<MANAGEMENT_TOKEN>"
+#
+# Optional: enable Bothouse Bridge WebSocket so /collab/panel/ Sessions Chat connects cleanly via /bridge/ws
+# [bridge]
+# enabled = true
+# port = 9810
+# path = "/bridge/ws"
+# token = "<BRIDGE_TOKEN>"
 

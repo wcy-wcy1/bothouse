@@ -163,7 +163,9 @@ class TeamWorkspace(CloudWebBase):
         self.assertEqual((await self.tw(ju, "claim", workspace_id="room-99"))["error"], "room-missing")
         self.assertEqual((await self.tw(ju, "release"))["error"], "not-workspace")
         self.assertEqual((await self.tw(ju, "list", chat="room-99"))["error"], "room-missing")
-        self.assertEqual((await self.tw(ju, "dispatch_mode"))["error"], "unsupported")
+        dm = await self.tw(ju, "dispatch_mode")
+        self.assertTrue(dm["ok"])
+        self.assertEqual((dm["dispatch_mode"], dm["dispatch_explicit"]), ("", False))
         self.assertEqual((await self.tw(ju, "nope"))["error"], "bad-op")
 
 

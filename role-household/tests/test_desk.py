@@ -74,8 +74,10 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
         _create_t3_db(self.t3_db)
         self._prev_t3 = os.environ.get("RH_T3_STATE_DB")
         self._prev_panel = os.environ.get("RH_PANEL_CONFIG")
+        self._prev_wiki = os.environ.get("RH_WIKI_DIR")
         os.environ["RH_T3_STATE_DB"] = str(self.t3_db)
         os.environ.pop("RH_PANEL_CONFIG", None)
+        os.environ.pop("RH_WIKI_DIR", None)
         self.hub = Hub(self.root / "hub.sqlite3", "test-token")
         self.app = make_app(self.hub)
         self.client = TestClient(TestServer(self.app))
@@ -92,6 +94,10 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
             os.environ.pop("RH_PANEL_CONFIG", None)
         else:
             os.environ["RH_PANEL_CONFIG"] = self._prev_panel
+        if self._prev_wiki is None:
+            os.environ.pop("RH_WIKI_DIR", None)
+        else:
+            os.environ["RH_WIKI_DIR"] = self._prev_wiki
         self.temp.cleanup()
 
     async def test_cookie_auth_and_desk_routes(self):
@@ -281,6 +287,161 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("LF will be replaced by CRLF", lines[4])
         self.assertEqual(lines[5], "🔧 List files")
         self.assertEqual(json.loads(meta_json)["state"], "completed")
+
+    async def test_dispatch_mode_and_workspace_inheritance(self):
+        headers = {"Authorization": "Bearer test-token"}
+        room_id = self.hub.first_room()
+        ws_room = self.hub.create_workspace(room_id)
+
+        bad = await self.client.patch(f"/api/rooms/{room_id}", json={"dispatch_mode": "bogus"}, headers=headers)
+        self.assertEqual(bad.status, 400)
+
+        patched = await self.client.patch(f"/api/rooms/{room_id}", json={"dispatch_mode": "team"}, headers=headers)
+        self.assertEqual(patched.status, 200)
+        self.assertEqual((await patched.json())["dispatch_mode"], "team")
+        self.assertEqual(self.hub.dispatch_setting(ws_room["id"]), ("team", True))
+
+        solo_res = await self.client.post(f"/api/rooms/{room_id}/messages", json={"text": "/solo"}, headers=headers)
+        self.assertEqual(solo_res.status, 200)
+        self.assertEqual((await solo_res.json())["author_kind"], "system")
+        self.assertEqual(self.hub.dispatch_setting(room_id), ("solo", True))
+        self.assertEqual(self.hub.dispatch_setting(ws_room["id"]), ("solo", True))
+
+        oneshot = await self.client.post(
+            f"/api/rooms/{room_id}/messages",
+            json={"text": "/team 重构前端面板"},
+            headers=headers,
+        )
+        self.assertEqual(oneshot.status, 200)
+        body = await oneshot.json()
+        self.assertEqual(body["text"], "[团队模式] 重构前端面板")
+        self.assertEqual(self.hub.dispatch_setting(room_id), ("solo", True))
+        self.assertEqual(self.hub.effective_dispatch_setting(room_id), ("team", True))
+        self.assertEqual(self.hub.effective_dispatch_setting(ws_room["id"]), ("team", True))
+
+        state = await (await self.client.get("/collab/api/state", headers=headers)).json()
+        main_room = next(r for r in state["rooms"] if r["id"] == f"room-{room_id}")
+        self.assertEqual(main_room["kind"], "chat")
+        self.assertEqual(main_room["dispatch_mode"], "team")
+
+    async def test_cloudweb_dispatch_mode_and_one_shot_routing(self):
+        headers = {"Authorization": "Bearer test-token"}
+        room_id = self.hub.first_room()
+        ws_ll = await self.client.ws_connect("/cloud-web/ws?bot=remote-ll&name=%E5%B0%8F%E6%A9%98", headers=headers)
+        ws_codex = await self.client.ws_connect("/cloud-web/ws?bot=local-codex&name=codex", headers=headers)
+        try:
+            await ws_ll.send_json({"type": "register", "project": "remote-ll"})
+            ack_ll = await ws_ll.receive_json()
+            self.assertTrue(ack_ll["ok"])
+            self.assertIn("dispatch_mode", ack_ll["capabilities"])
+
+            await ws_codex.send_json({"type": "register", "project": "local-codex"})
+            ack_cx = await ws_codex.receive_json()
+            self.assertTrue(ack_cx["ok"])
+
+            await ws_ll.send_json({
+                "type": "team_workspace",
+                "ref_id": "tw-1",
+                "op": "dispatch_mode",
+                "reply_ctx": f"room-{room_id}",
+                "chat_id": f"room-{room_id}",
+            })
+            tw_ack = await ws_ll.receive_json()
+            self.assertEqual(tw_ack["ref_id"], "tw-1")
+            self.assertTrue(tw_ack["ok"])
+            self.assertFalse(tw_ack["dispatch_explicit"])
+
+            await self.client.post(f"/api/rooms/{room_id}/messages", json={"text": "/team 请排查 Bridge 故障"}, headers=headers)
+            ll_frame = await ws_ll.receive_json()
+            cx_frame = await ws_codex.receive_json()
+            self.assertTrue(ll_frame["mentioned"])
+            self.assertFalse(cx_frame["mentioned"])
+            self.assertIn("[团队模式] 请排查 Bridge 故障", ll_frame["content"])
+
+            await self.client.post(f"/api/rooms/{room_id}/messages", json={"text": "/team"}, headers=headers)
+            await self.client.post(f"/api/rooms/{room_id}/messages", json={"text": "@codex 只看一个报错"}, headers=headers)
+            ll_explicit = await ws_ll.receive_json()
+            cx_explicit = await ws_codex.receive_json()
+            self.assertFalse(ll_explicit["mentioned"])
+            self.assertTrue(cx_explicit["mentioned"])
+        finally:
+            await ws_ll.close()
+            await ws_codex.close()
+
+    async def test_wiki_galaxy_routes(self):
+        wiki_root = self.root / "wiki"
+        (wiki_root / "sub").mkdir(parents=True)
+        (wiki_root / "README.md").write_text("---\ndescription: 总览\n---\n# 知识库总览\n\n查看 [[sub/guide]]。\n", encoding="utf-8")
+        (wiki_root / "sub" / "guide.md").write_text("# 使用指南\n\n回到 [首页](../README.md)。\n", encoding="utf-8")
+
+        await self.client.close()
+        os.environ["RH_WIKI_DIR"] = str(wiki_root)
+        self.app = make_app(self.hub)
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+        headers = {"Authorization": "Bearer test-token"}
+        self.assertEqual((await self.client.get("/collab/wiki-galaxy")).status, 401)
+        self.assertEqual((await self.client.get("/collab/api/wiki-galaxy")).status, 401)
+
+        redir = await self.client.get("/collab", headers=headers, allow_redirects=False)
+        self.assertEqual(redir.status, 302)
+        self.assertEqual(redir.headers["Location"], "/")
+
+        page = await self.client.get("/collab/wiki-galaxy", headers=headers, allow_redirects=False)
+        self.assertEqual(page.status, 200)
+        self.assertIn("WIKI 星河", await page.text())
+
+        data = await (await self.client.get("/collab/api/wiki-galaxy", headers=headers)).json()
+        node_ids = {n["id"] for n in data["nodes"]}
+        self.assertEqual(node_ids, {"README.md", "sub/guide.md"})
+        self.assertEqual(data["groups"], {"": 1, "sub": 1})
+        self.assertEqual(len(data["links"]), 1)
+
+    async def test_bridge_ws_relay(self):
+        upstream = web.Application()
+        seen_query = {}
+
+        async def bridge_handler(request):
+            seen_query["token"] = request.query.get("token")
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            await ws.send_json({"type": "hello", "ok": True})
+            async for msg in ws:
+                if msg.data == "ping":
+                    await ws.send_str("pong")
+            return ws
+
+        upstream.router.add_get("/bridge/ws", bridge_handler)
+        server = TestServer(upstream)
+        await server.start_server()
+        try:
+            config = self.root / "bridge.toml"
+            config.write_text(
+                f'[management]\nenabled=true\nhost="127.0.0.1"\nport={server.port}\ntoken="m"\n'
+                f'[bridge]\nenabled=true\nport={server.port}\npath="/bridge/ws"\ntoken="br-secret"\n',
+                encoding="utf-8",
+            )
+            await self.client.close()
+            os.environ["RH_PANEL_CONFIG"] = str(config)
+            self.app = make_app(self.hub)
+            self.client = TestClient(TestServer(self.app))
+            await self.client.start_server()
+
+            unauthed = await self.client.get("/bridge/ws?token=br-secret")
+            self.assertEqual(unauthed.status, 401)
+
+            ws = await self.client.ws_connect("/bridge/ws?token=br-secret", headers={"Authorization": "Bearer test-token"})
+            try:
+                hello = await ws.receive_json()
+                self.assertEqual(hello, {"type": "hello", "ok": True})
+                await ws.send_str("ping")
+                self.assertEqual(await ws.receive_str(), "pong")
+                self.assertEqual(seen_query["token"], "br-secret")
+            finally:
+                await ws.close()
+        finally:
+            await server.close()
 
 
 if __name__ == "__main__":

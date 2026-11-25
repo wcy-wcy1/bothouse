@@ -191,6 +191,13 @@ MIGRATE_WORKSPACE = [
 ]
 WORKSPACE_PREFIX = "工作区"   # 工作区名「工作区<n>」，同 store.mjs WORKSPACE_PREFIX
 WORKSPACE_RE = re.compile(rf"^{WORKSPACE_PREFIX}(\d+)$")
+DISPATCH_MODES = ("solo", "mixed", "team")
+DISPATCH_LABELS = {"solo": "单兵", "mixed": "混合", "team": "团队", "": "自动（按配置）"}
+DISPATCH_ALIAS = {"solo": "solo", "单兵": "solo", "mixed": "mixed", "混合": "mixed", "team": "team", "团队": "team", "auto": "", "default": "", "自动": ""}
+DISPATCH_HINT_RE = re.compile(r"^\s*(?:\[团队模式\]|团队模式(?:[：:]|\s+))")
+SLASH_ONE_SHOT_RE = re.compile(r"^\s*/(?:team|团队)(?:[：:]\s*|\s+)(.+)$", re.S | re.I)
+SLASH_MODE_RE = re.compile(r"^\s*/(team|团队|solo|单兵|mixed|混合|mode|模式)(?:(?:\s+|[:：]\s*)(\S+))?\s*$", re.I)
+MIGRATE_DISPATCH = ("dispatch_mode", "ALTER TABLE rooms ADD COLUMN dispatch_mode TEXT NOT NULL DEFAULT ''")
 
 
 def add_column(db: sqlite3.Connection, sql: str) -> None:
@@ -275,7 +282,7 @@ class Hub:
         if "from_turn" not in {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}:
             add_column(self.db, MIGRATE_FROM_TURN)
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(rooms)")}
-        for col, sql in MIGRATE_WORKSPACE:
+        for col, sql in [*MIGRATE_WORKSPACE, MIGRATE_DISPATCH]:
             if col not in cols:
                 add_column(self.db, sql)
         # 上次进程留下的“在说”：说话的那个 host 连接已经不在了，改成被打断，否则网页上一直亮着。
@@ -295,6 +302,8 @@ class Hub:
         self.listeners: list = []
         self.bot_listeners: list = []
         self.thinking_listeners: list = []
+        self.room_listeners: list = []
+        self._one_shot_team_until: dict[int, float] = {}
         self.bots_online: set[str] = set()   # 现在连着的 cc-connect bot（rh/cloudweb.py 维护）
         self.bot_thinking: dict[int, list[str]] = {}   # 频道 id -> 正在干活的 bot（按开始的先后；空的不在表里）
         # 推送：VAPID 钥匙、怎么算 @ 我（bot 照 Discord 习惯写 <@我的 Discord ID> 时也认，ID 只收数字，同 cloudweb mention_id）
@@ -402,11 +411,15 @@ class Hub:
         return self.room(cur.lastrowid)
 
     def update_room(self, room_id: int, body: object) -> dict:
-        """改名、归档（archived=true）、恢复（archived=false）。频道和消息都不删。"""
-        if not isinstance(body, dict) or not ({"name", "archived"} & body.keys()):
-            raise BadRequest("body must be {name?: str, archived?: bool}")
+        """改名、归档（archived=true）、恢复（archived=false）、调度模式（dispatch_mode）。频道和消息都不删。"""
+        if not isinstance(body, dict) or not ({"name", "archived", "dispatch_mode"} & body.keys()):
+            raise BadRequest("body must be {name?: str, archived?: bool, dispatch_mode?: str}")
         if "archived" in body and not isinstance(body["archived"], bool):
             raise BadRequest("archived must be bool")
+        if "dispatch_mode" in body:
+            dm = body["dispatch_mode"]
+            if not isinstance(dm, str) or (dm != "" and dm not in DISPATCH_MODES):
+                raise BadRequest("dispatch_mode must be '', 'solo', 'mixed', or 'team'")
         name = self._room_name(body) if "name" in body else None
         if body.get("archived") and room_id == self.first_room():
             raise BadRequest("默认频道不能删除")
@@ -417,9 +430,86 @@ class Hub:
                 if "archived" in body:
                     self.db.execute("UPDATE rooms SET archived_at=? WHERE id=?",
                                     (time.time() if body["archived"] else None, room_id))
+                if "dispatch_mode" in body:
+                    r = self.room(room_id)
+                    target = self._chat_of(r) if r is not None else room_id
+                    self.db.execute("UPDATE rooms SET dispatch_mode=? WHERE id=?", (body["dispatch_mode"], target))
+                    self._one_shot_team_until.pop(target, None)
         except sqlite3.IntegrityError:
             raise Conflict("同名频道已存在（可能在已归档里）")
         return self.room(room_id)
+
+    def dispatch_setting(self, room_id: int) -> tuple[str, bool]:
+        """频道持久调度模式（工作区继承所属主聊天频道），返回 (mode, explicit)。"""
+        r = self.room(room_id)
+        if r is None:
+            return "", False
+        target_id = self._chat_of(r)
+        target = r if target_id == r["id"] else self.room(target_id)
+        mode = str((target or {}).get("dispatch_mode") or "").strip()
+        if mode in DISPATCH_MODES:
+            return mode, True
+        return "", False
+
+    def set_one_shot_team(self, room_id: int, seconds: float = 30.0) -> None:
+        r = self.room(room_id)
+        target = self._chat_of(r) if r is not None else room_id
+        self._one_shot_team_until[target] = time.monotonic() + seconds
+
+    @staticmethod
+    def is_one_shot_team_msg(text: object) -> bool:
+        return bool(isinstance(text, str) and DISPATCH_HINT_RE.match(text))
+
+    def effective_dispatch_setting(self, room_id: int) -> tuple[str, bool]:
+        """包含单轮强制触发窗口的有效调度模式，返回 (mode, explicit)。"""
+        r = self.room(room_id)
+        target = self._chat_of(r) if r is not None else room_id
+        if self._one_shot_team_until.get(target, 0.0) > time.monotonic():
+            return "team", True
+        return self.dispatch_setting(room_id)
+
+    def handle_dispatch_command(self, room_id: int, body: object) -> tuple[dict, bool, bool] | None:
+        """拦截 /team、/solo、/mixed、/mode 与 /team <任务>；返回 (msg, new, rooms_changed) 或 None。"""
+        if not isinstance(body, dict) or body.get("author_kind", "user") != "user":
+            return None
+        raw = body.get("text")
+        if not isinstance(raw, str):
+            return None
+        one_shot_m = SLASH_ONE_SHOT_RE.match(raw)
+        if one_shot_m and one_shot_m.group(1).strip():
+            task = one_shot_m.group(1).strip()
+            msg, new = self.create(room_id, {**body, "text": f"[团队模式] {task}"})
+            if new:
+                self.set_one_shot_team(room_id)
+            return msg, new, False
+        mode_m = SLASH_MODE_RE.match(raw)
+        if not mode_m:
+            return None
+        cmd = mode_m.group(1).lower()
+        arg = (mode_m.group(2) or "").lower()
+        r = self.room(room_id)
+        if r is not None and r["archived_at"] is not None:
+            raise Conflict("频道已归档，先恢复才能发消息")
+        client_key = body.get("client_key")
+        if cmd in ("mode", "模式") and arg in ("", "status", "状态"):
+            cur_mode, explicit = self.dispatch_setting(room_id)
+            label = DISPATCH_LABELS.get(cur_mode, cur_mode or "自动") if explicit else "自动（按配置 / 混合）"
+            msg, new = self.create(room_id, {"author_kind": "system", "text": f"当前频道调度模式：{label}",
+                                              **({"client_key": client_key} if client_key else {})})
+            return msg, new, False
+        target_mode = DISPATCH_ALIAS.get(arg if cmd in ("mode", "模式") else cmd)
+        if target_mode is None:
+            msg, new = self.create(room_id, {"author_kind": "system",
+                                              "text": "用法：/team [任务] | /mixed | /solo | /mode [solo|mixed|team|auto]",
+                                              **({"client_key": client_key} if client_key else {})})
+            return msg, new, False
+        self.update_room(room_id, {"dispatch_mode": target_mode})
+        msg, new = self.create(room_id, {
+            "author_kind": "system",
+            "text": f"频道调度模式已切换为「{DISPATCH_LABELS.get(target_mode, target_mode)}」",
+            **({"client_key": client_key} if client_key else {}),
+        })
+        return msg, new, True
 
     # ---------- 工作区（cc-connect team_workspace，语义照 collab/store.mjs:346-460） ----------
     def _chat_of(self, room: dict) -> int:
@@ -632,6 +722,8 @@ class Hub:
         status = body.get("status", DEFAULT_STATUS[kind])
         if status not in STATUSES:
             raise BadRequest("bad status")
+        if kind == "user" and self.is_one_shot_team_msg(text):
+            self.set_one_shot_team(room_id)
         now = time.time()
         cur = self.db.execute(
             "INSERT INTO messages(room_id, author_kind, author, name, text, status, spoken, created_at, updated_at,"
@@ -753,6 +845,8 @@ class Hub:
 
     async def rooms_changed(self) -> None:
         await self.broadcast({"type": "rooms", "rooms": self.rooms(True)})
+        if self.room_listeners:
+            await asyncio.gather(*(cb() for cb in list(self.room_listeners)), return_exceptions=True)
 
     async def from_web(self, ws: web.WebSocketResponse, d: dict) -> None:
         if d.get("type") == "join":
@@ -1113,6 +1207,15 @@ def make_app(hub: Hub) -> web.Application:
     async def post_message(request):
         room_id = room_or_404(request)
         body = await body_json(request)
+        cmd_res = hub.handle_dispatch_command(room_id, body)
+        if cmd_res is not None:
+            msg, new, changed = cmd_res
+            if changed:
+                await hub.rooms_changed()
+            if new:
+                await hub.broadcast({"type": "message", "message": msg}, room_id)
+                await hub.notify_new(msg)
+            return web.json_response(msg)
         msg, new = hub.create(room_id, body)
         if new:
             await hub.broadcast({"type": "message", "message": msg}, room_id)

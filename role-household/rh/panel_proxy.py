@@ -57,20 +57,30 @@ def attach(app: web.Application, hub, config_path: str | Path | None = None) -> 
     cfg_path = config_path or os.environ.get("RH_PANEL_CONFIG")
     session: ClientSession | None = None
 
-    def settings():
+    def _read_toml() -> tuple[dict | None, str | None, str]:
         if not cfg_path or not Path(cfg_path).is_file():
             return None, "管理面板配置不存在", "请确认 RH_PANEL_CONFIG 指向本机 bothouse config.toml。"
         try:
-            value = tomllib.loads(Path(cfg_path).read_text("utf-8")).get("management", {})
+            return tomllib.loads(Path(cfg_path).read_text("utf-8")), None, ""
         except (OSError, tomllib.TOMLDecodeError):
-            return None, "管理面板配置无法读取", "请检查 [management] TOML 格式是否正确。"
-        if value.get("enabled") is not True:
-            return None, "bothouse 管理接口未启用", "请在 [management] 中设置 enabled = true 并重启 bothouse。"
-        host = str(value.get("host", "127.0.0.1"))
+            return None, "管理面板配置无法读取", "请检查 TOML 格式是否正确。"
+
+    def _norm_host(raw: object) -> str:
+        host = str(raw or "127.0.0.1")
         if host in ("", "0.0.0.0", "::", "[::]"):
-            host = "127.0.0.1"
-        elif ":" in host and not host.startswith("["):
-            host = f"[{host}]"
+            return "127.0.0.1"
+        if ":" in host and not host.startswith("["):
+            return f"[{host}]"
+        return host
+
+    def settings():
+        data, err, help_text = _read_toml()
+        if err:
+            return None, err, help_text
+        value = data.get("management", {})
+        if not isinstance(value, dict) or value.get("enabled") is not True:
+            return None, "bothouse 管理接口未启用", "请在 [management] 中设置 enabled = true 并重启 bothouse。"
+        host = _norm_host(value.get("host", "127.0.0.1"))
         try:
             port = int(value["port"])
             if not 1 <= port <= 65535:
@@ -79,11 +89,85 @@ def attach(app: web.Application, hub, config_path: str | Path | None = None) -> 
             return None, "管理面板端口配置无效", "请检查 [management].port。"
         return {"base": f"http://{host}:{port}", "token": str(value.get("token", ""))}, None, ""
 
+    def bridge_settings():
+        data, err, _help = _read_toml()
+        if err:
+            return None, err
+        value = data.get("bridge", {})
+        if not isinstance(value, dict) or value.get("enabled") is not True:
+            return None, "bothouse Bridge 未启用"
+        host = _norm_host(value.get("host", "127.0.0.1"))
+        try:
+            port = int(value.get("port", 9810))
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except (TypeError, ValueError):
+            return None, "bothouse Bridge 端口配置无效"
+        raw_path = str(value.get("path") or "/bridge/ws").strip()
+        ws_path = raw_path if raw_path.startswith("/") else "/" + raw_path
+        return {"base": f"http://{host}:{port}", "path": ws_path}, None
+
+    async def _relay_ws(request: web.Request, upstream_url: str, headers: dict[str, str], err_msg: str):
+        raw_proto = request.headers.get("Sec-WebSocket-Protocol", "")
+        protocols = [part.strip() for part in raw_proto.split(",") if part.strip()]
+        try:
+            upstream = await session.ws_connect(upstream_url, headers=headers, protocols=protocols or ())
+        except (ClientError, OSError, asyncio.TimeoutError):
+            return web.json_response({"ok": False, "error": err_msg}, status=502)
+        downstream = web.WebSocketResponse(autoping=True)
+        await downstream.prepare(request)
+
+        async def down_to_up():
+            async for msg in downstream:
+                if msg.type == WSMsgType.TEXT:
+                    await upstream.send_str(msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    await upstream.send_bytes(msg.data)
+
+        async def up_to_down():
+            async for msg in upstream:
+                if msg.type == WSMsgType.TEXT:
+                    await downstream.send_str(msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    await downstream.send_bytes(msg.data)
+
+        tasks = [asyncio.create_task(down_to_up()), asyncio.create_task(up_to_down())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for ws_conn in (upstream, downstream):
+                if not ws_conn.closed:
+                    try:
+                        await ws_conn.close()
+                    except Exception:
+                        pass
+        return downstream
+
     async def redirect(request: web.Request):
         raise web.HTTPPermanentRedirect(f"{PANEL_PREFIX}/")
 
     async def legacy(request: web.Request):
         raise web.HTTPPermanentRedirect(f"{PANEL_PREFIX}/" + (("?" + request.query_string) if request.query_string else ""))
+
+    async def bridge_ws(request: web.Request):
+        if not is_web_authed(hub, request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        bcfg, error = bridge_settings()
+        if error:
+            return web.json_response({"ok": False, "error": error}, status=503)
+        if session is None:
+            return web.json_response({"ok": False, "error": "proxy session unavailable"}, status=502)
+        if request.headers.get("Upgrade", "").lower() != "websocket":
+            return web.json_response({"ok": False, "error": "websocket required"}, status=400)
+        upstream_url = bcfg["base"] + bcfg["path"]
+        if request.query_string:
+            upstream_url += "?" + request.query_string
+        headers = {k: v for k, v in request.headers.items() if k.lower() in SAFE_REQUEST_HEADERS}
+        return await _relay_ws(request, upstream_url, headers, "Bridge WebSocket 不可达")
 
     async def proxy(request: web.Request):
         if request.path == f"{PANEL_PREFIX}/" and request.method == "GET" and request.query.get("token") and hub.token_ok(request.query["token"]):
@@ -124,36 +208,7 @@ def attach(app: web.Application, hub, config_path: str | Path | None = None) -> 
             headers["Authorization"] = "Bearer " + config["token"]
 
         if request.headers.get("Upgrade", "").lower() == "websocket":
-            raw_proto = request.headers.get("Sec-WebSocket-Protocol", "")
-            protocols = [part.strip() for part in raw_proto.split(",") if part.strip()]
-            try:
-                upstream = await session.ws_connect(upstream_url, headers=headers, protocols=protocols or ())
-            except (ClientError, OSError, asyncio.TimeoutError):
-                return web.json_response({"ok": False, "error": "管理面板 WebSocket 不可达"}, status=502)
-            downstream = web.WebSocketResponse(autoping=True)
-            await downstream.prepare(request)
-
-            async def down_to_up():
-                async for msg in downstream:
-                    if msg.type == WSMsgType.TEXT:
-                        await upstream.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await upstream.send_bytes(msg.data)
-
-            async def up_to_down():
-                async for msg in upstream:
-                    if msg.type == WSMsgType.TEXT:
-                        await downstream.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await downstream.send_bytes(msg.data)
-
-            tasks = [asyncio.create_task(down_to_up()), asyncio.create_task(up_to_down())]
-            _done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await upstream.close()
-            await downstream.close()
-            return downstream
+            return await _relay_ws(request, upstream_url, headers, "管理面板 WebSocket 不可达")
 
         body = await request.read() if request.method not in ("GET", "HEAD") else None
         try:
@@ -194,6 +249,10 @@ def attach(app: web.Application, hub, config_path: str | Path | None = None) -> 
     app.on_cleanup.append(cleanup)
     app.router.add_get("/panel", redirect)
     app.router.add_get("/panel/", redirect)
+    app.router.add_get("/bridge/ws", bridge_ws)
+    bcfg, _ = bridge_settings()
+    if bcfg and bcfg["path"] != "/bridge/ws":
+        app.router.add_get(bcfg["path"], bridge_ws)
     app.router.add_get(PANEL_PREFIX, legacy)
     app.router.add_route("*", f"{PANEL_PREFIX}/", proxy)
     app.router.add_route("*", f"{PANEL_PREFIX}/{{tail:.*}}", proxy)

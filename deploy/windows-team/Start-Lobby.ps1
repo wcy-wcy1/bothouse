@@ -7,6 +7,7 @@ param(
     [string]$UserMentionId,
     [string]$T3StateDb,
     [string]$PanelConfig,
+    [string]$WikiDir,
     [string]$LogFile
 )
 
@@ -23,6 +24,7 @@ $previousUserMention = $env:RH_USER_MENTION_ID
 $previousSslCertFile = $env:SSL_CERT_FILE
 $previousT3StateDb = $env:RH_T3_STATE_DB
 $previousPanelConfig = $env:RH_PANEL_CONFIG
+$previousWikiDir = $env:RH_WIKI_DIR
 
 $env:RH_HUB_TOKEN = $state.web_token
 $env:RH_BOT_TOKEN = $state.bot_token
@@ -35,6 +37,9 @@ if ($T3StateDb) {
 }
 if ($PanelConfig) {
     $env:RH_PANEL_CONFIG = $PanelConfig
+}
+if ($WikiDir) {
+    $env:RH_WIKI_DIR = $WikiDir
 }
 if (-not $env:SSL_CERT_FILE -and $PythonPath) {
     $ErrorActionPreference = 'Continue'
@@ -78,4 +83,5 @@ try {
     $env:SSL_CERT_FILE = $previousSslCertFile
     $env:RH_T3_STATE_DB = $previousT3StateDb
     $env:RH_PANEL_CONFIG = $previousPanelConfig
+    $env:RH_WIKI_DIR = $previousWikiDir
 }
