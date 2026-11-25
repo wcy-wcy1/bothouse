@@ -10,6 +10,7 @@ from pathlib import Path
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from rh.cloudweb import PROGRESS_PREFIX, card_from
 from rh.hub import Hub, make_app
 
 
@@ -255,6 +256,31 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(down_api.status, 502)
         finally:
             await server.close()
+
+    def test_progress_card_cleaning(self):
+        payload = {
+            "agent": "Codex",
+            "state": "completed",
+            "steps": 13,
+            "elapsed_sec": 382,
+            "items": [
+                {"kind": "tool_use", "tool": "Bash", "text": '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command \'git add -- slides\''},
+                {"kind": "tool_result", "tool": "Bash", "status": "completed", "exit_code": 0, "text": "🧾 Bash 🟢 状态: completed 🔢 退出码: 0 _无输出_"},
+                {"kind": "tool_result", "tool": "Bash", "status": "failed", "exit_code": 1, "text": "🧾 Bash 🔴 状态: failed 🔢 退出码: 1 _无输出_"},
+                {"kind": "tool_result", "tool": "Bash", "status": "completed", "exit_code": 0, "text": "warning: in the working copy of 'a.py', LF will be replaced by CRLF the next time Git touches it [main abc123] ok"},
+                {"kind": "tool_use", "tool": "PowerShell", "text": '{"command":"dir","description":"List files"}'},
+            ],
+        }
+        text, meta_json = card_from(PROGRESS_PREFIX + json.dumps(payload, ensure_ascii=False))
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "第 13 步 · 6分22秒")
+        self.assertEqual(lines[1], "🔧 git add -- slides")
+        self.assertEqual(lines[2], "✓ Bash")
+        self.assertEqual(lines[3], "❌ Bash (exit 1)")
+        self.assertIn("[main abc123] ok", lines[4])
+        self.assertNotIn("LF will be replaced by CRLF", lines[4])
+        self.assertEqual(lines[5], "🔧 List files")
+        self.assertEqual(json.loads(meta_json)["state"], "completed")
 
 
 if __name__ == "__main__":

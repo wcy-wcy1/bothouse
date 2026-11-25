@@ -149,12 +149,19 @@
   .daydiv { flex:none; display:flex; align-items:center; gap:8px; margin:24px 16px 8px; color:var(--faint); font-size:12px; font-weight:600; }
   .daydiv::before, .daydiv::after { content:""; flex:1; height:1px; background:#3f4147; }
   .daydiv + .msg, .daydiv + .newdiv { margin-top:0; }
-  .pcard { margin-top:4px; max-width:520px; border-left:4px solid var(--blurple); background:var(--side); border-radius:4px;
-           padding:8px 12px 10px; }
+  .pcard { margin-top:4px; max-width:560px; border-left:4px solid var(--blurple); background:var(--side); border-radius:4px;
+           padding:6px 12px 8px; }
   .pcard.completed { border-left-color:var(--green); }
   .pcard.failed { border-left-color:var(--red); }
-  .pcard .pt { font-weight:600; color:var(--head); font-size:14px; margin-bottom:4px; }
-  .pcard .pb { font-size:13px; color:var(--text); white-space:pre-wrap; word-break:break-word; line-height:1.45; }
+  .pcard summary.pt { display:flex; align-items:center; gap:8px; font-weight:600; color:var(--head); font-size:13.5px;
+                      cursor:pointer; list-style:none; user-select:none; }
+  .pcard summary.pt::-webkit-details-marker { display:none; }
+  .pcard .pm { font-weight:400; font-size:12px; color:var(--muted); }
+  .pcard .ptog { margin-left:auto; font-size:11px; font-weight:500; color:var(--muted); white-space:nowrap; }
+  .pcard .ptog::after { content:"展开 ▸"; }
+  .pcard[open] .ptog::after { content:"收起 ▾"; }
+  .pcard .pb { font-size:12.5px; color:var(--muted); white-space:pre-wrap; word-break:break-word; line-height:1.45;
+               margin-top:6px; padding-top:6px; border-top:1px solid #3f4147; }
   /* ---- 登录 ---- */
   #login { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); align-items:center; justify-content:center; z-index:9; }
   #login .card { background:var(--chat); border-radius:8px; padding:28px 32px; width:420px; max-width:92vw; text-align:center; }
@@ -566,6 +573,48 @@ function renderEmpty() {
 }
 // 一条消息的 HTML；prev 是它前一条（同一人 7 分钟内合并成一组）。x.local 是本页还没发成的那条（rh-client.js pending）。
 // 正文：用户、角色消息按 Markdown 子集渲染（rh-md.js，提及高亮），系统消息原样转义。
+const cardOpen = new Map();
+$("log").addEventListener("toggle", (e) => {
+  const d = e.target;
+  if (d && d.classList && d.classList.contains("pcard") && d.dataset.cardId) cardOpen.set(d.dataset.cardId, d.open);
+}, true);
+function cleanCardDisplay(raw) {
+  const lines = String(raw || "").split("\n");
+  let meta = "";
+  if (lines.length && /^第\s*\d+\s*步\s*·\s*/.test(lines[0])) meta = lines.shift().trim();
+  const cleaned = lines.map((line) => {
+    let s = line.replace(/warning:\s+in the working copy of '[^']+',\s*LF will be replaced by CRLF(?:\s+the next time Git touches it\b)?\s*/gi, "");
+    if (s.startsWith("🔧 ")) {
+      const dm = s.match(/"description"\s*:\s*"([^"]+)/) || s.match(/"command"\s*:\s*"([^"]+)/);
+      if (/^🔧\s+\S+\s+—\s+\{/.test(s) && dm) {
+        s = "🔧 " + dm[1].replace(/\\u0026/g, "&").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+      }
+      s = s.replace(/^🔧\s+(?:(?:Bash|PowerShell|Shell|cmd)\s+—\s+)?(?:"[^"]*(?:pwsh|powershell|cmd)(?:\.exe)?"|(?:pwsh|powershell|cmd)(?:\.exe)?)(?:\s+(?:-[A-Za-z]+|\/[A-Za-z]+))*\s+/i, "🔧 ");
+      s = s.replace(/^🔧\s+(['"])(.*)\1$/, "🔧 $2").replace(/^🔧\s+['"]/, "🔧 ").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+      return s.trim();
+    }
+    const m = s.match(/^🧾\s+(?:(\S+)\s+—\s+)?(completed|failed)\s*·\s*exit\s+(-?\d+)\s*·\s*(.*)$/);
+    if (m) {
+      const tool = m[1] || "命令", ok = m[2] !== "failed" && Number(m[3]) === 0, icon = ok ? "✓" : "❌";
+      let rest = m[4].replace(/^(?:🧾\s*\S+\s*)?(?:[🟢🔴🟡⚪]\s*)?(?:状态\s*[:：]\s*\S+\s*)?(?:🔢\s*退出码\s*[:：]\s*-?\d+\s*)?/, "").trim();
+      if (!rest || /^_?无输出_?\.{0,3}$/i.test(rest) || /^\(no output\)$/i.test(rest)) {
+        return `${icon} ${tool}${ok ? "" : ` (exit ${m[3]})`}`;
+      }
+      return `${icon} ${tool}${ok ? "" : ` · exit ${m[3]}`} · ${rest}`;
+    }
+    return s.trim();
+  }).filter(Boolean);
+  return {meta, body: cleaned.join("\n")};
+}
+function cardHTML(x, card, raw) {
+  const {meta, body} = cleanCardDisplay(raw);
+  const id = String(x.id ?? "");
+  const open = cardOpen.has(id) ? cardOpen.get(id) : card.state === "running";
+  const icon = card.state === "completed" ? "✅" : card.state === "failed" ? "❌" : "⏳";
+  const bodyHtml = body ? `<div class="pb">${renderMarkdownInline(body, [], null).replace(/&lt;t:(\d+):R&gt;/g, (_, t) => hhmm(+t))}</div>` : "";
+  return `<details class="pcard ${esc(card.state)}" data-card-id="${esc(id)}"${open ? " open" : ""}>`
+    + `<summary class="pt"><span>${icon} ${esc(card.title)}</span>${meta ? `<span class="pm">${esc(meta)}</span>` : ""}<span class="ptog"></span></summary>${bodyHtml}</details>`;
+}
 function msgHTML(x, prev, color) {
     const raw = x.status === "interrupted" && x.spoken != null ? x.text.slice(0, x.spoken) + "……" : x.text;
     let card = null;   // bot 的进度卡片、子进程表（rh/cloudweb.py card_from / subtask_table_from）；坏数据当普通消息画。
@@ -576,7 +625,7 @@ function msgHTML(x, prev, color) {
     const [main, foot] = card ? [raw, null] : splitFoot(x, raw);
     const me = x.author_kind === "user" ? null : ME;   // 自己发的 @用户 不算别人提到我
     const text = x.author_kind === "system" ? esc(raw) : card
-      ? `<div class="pcard ${esc(card.state)}"><div class="pt">${esc(card.title)}</div><div class="pb">${renderMarkdownInline(raw, [], null).replace(/&lt;t:(\d+):R&gt;/g, (_, t) => hhmm(+t))}</div></div>`
+      ? cardHTML(x, card, raw)
       : renderMarkdown(main, roleNames(), me) + (foot ? `<div class="foot">${esc(foot).replace(/\n/g, "<br>")}</div>` : "");
     if (x.author_kind === "system") {
       return `<div class="msg system"><div class="av">→</div><div class="body"><span class="who">${esc(x.name)}</span><span class="text">${text}</span><span class="t2" title="${fmt(x.created_at)}">${shortTime(x.created_at)}</span></div></div>`;

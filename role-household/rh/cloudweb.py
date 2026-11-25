@@ -80,6 +80,19 @@ PROGRESS_PREFIX = "__cc_connect_progress_card_v1__:"
 CARD_STATES = {"running": "处理中", "completed": "已完成", "failed": "失败"}
 CARD_ICONS = {"thinking": "💭", "tool_use": "🔧", "tool_result": "🧾", "error": "❌"}
 CARD_LINE_LEN = 80  # payload 没带 line_len 时一行多少字。来源：discord/progress.go maxDiscordProgressLineLen。
+_PWSH_WRAP_RE = re.compile(
+    r'^(?:"[^"]*(?:pwsh|powershell|cmd)(?:\.exe)?"|(?:pwsh|powershell|cmd)(?:\.exe)?)'
+    r'(?:\s+(?:-[A-Za-z]+|/[A-Za-z]+))*\s+',
+    re.I,
+)
+_DUP_RESULT_RE = re.compile(
+    r'^(?:🧾\s*\S+\s*)?(?:[🟢🔴🟡⚪]\s*)?(?:状态\s*[:：]\s*\S+\s*)?(?:🔢\s*退出码\s*[:：]\s*-?\d+\s*)?'
+)
+_CRLF_WARN_RE = re.compile(
+    r"warning:\s+in the working copy of '[^']+',\s*LF will be replaced by CRLF(?:\s+the next time Git touches it\b)?\s*",
+    re.I,
+)
+_EMPTY_OUT = {"", "_无输出_", "无输出", "(no output)", "no output", "-"}
 # 这些开头的是 cc-connect 的状态提示，不转给队友。来源：conest bridge/platform/discord/discord.go isBotNotice。
 NOTICE_PREFIXES = ("📬", "✅", "↪", "⏳", "🔄", "⏹", "⏸")
 # cc-connect 加在回复末尾的「模型 · 用量」尾注，转给队友前去掉。来源：discord.go botFooter。
@@ -94,6 +107,38 @@ FENCE = "```"
 def _trim(s: str, n: int) -> str:
     s = " ".join(str(s).split())   # 同 compactDiscordProgressText：换行、连续空白并成一个空格
     return s if len(s) <= n else s[:max(n - 1, 0)] + "…"
+
+
+def _clean_tool_use_text(text: str) -> str:
+    s = str(text or "").strip()
+    if s.startswith("{"):
+        picked = ""
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                picked = str(obj.get("description") or obj.get("command") or obj.get("file_path") or "").strip()
+        except ValueError:
+            m = re.search(r'"description"\s*:\s*"([^"]+)', s) or re.search(r'"command"\s*:\s*"([^"]+)', s)
+            if m:
+                picked = m.group(1)
+        if picked:
+            s = picked.replace("\\u0026", "&").replace('\\"', '"').replace("\\\\", "\\")
+    m = _PWSH_WRAP_RE.match(s)
+    if m and m.end() < len(s):
+        s = s[m.end():].strip()
+    if len(s) >= 2 and s[0] in ("'", '"') and s[-1] == s[0]:
+        s = s[1:-1]
+    elif s[:1] in ("'", '"'):
+        s = s[1:]
+    return s.replace('\\"', '"').replace("\\\\", "\\").strip()
+
+
+def _clean_tool_result_text(text: str) -> str:
+    s = _CRLF_WARN_RE.sub("", str(text or "").strip())
+    s = _DUP_RESULT_RE.sub("", s).strip()
+    if s.lower().rstrip("….") in _EMPTY_OUT or s in _EMPTY_OUT:
+        return ""
+    return s
 
 
 def card_from(content: str) -> tuple[str, str] | None:
@@ -113,22 +158,33 @@ def card_from(content: str) -> tuple[str, str] | None:
     sec = p.get("elapsed_sec") if isinstance(p.get("elapsed_sec"), int) else 0
     n = p.get("line_len") if isinstance(p.get("line_len"), int) and p.get("line_len") > 0 else CARD_LINE_LEN
     lines = [f"第 {steps} 步 · " + (f"{sec // 60}分{sec % 60:02d}秒" if sec >= 60 else f"{sec}秒")]
-    items = p.get("items") if isinstance(p.get("items"), list) else         [{"kind": "info", "text": e} for e in p.get("entries") or [] if isinstance(e, str)]
+    items = p.get("items") if isinstance(p.get("items"), list) else \
+        [{"kind": "info", "text": e} for e in p.get("entries") or [] if isinstance(e, str)]
     for it in items:
         if not isinstance(it, dict) or not str(it.get("text") or "").strip():
             continue
         kind, text, tool = it.get("kind"), str(it["text"]), str(it.get("tool") or "").strip()
         if kind == "tool_use":
-            body = f"{tool or '工具'} — {_trim(text, n)}"
+            cleaned = _clean_tool_use_text(text) or text
+            if tool.lower() in ("bash", "powershell", "shell", "cmd", ""):
+                lines.append(f"🔧 {_trim(cleaned, n - 2)}")
+            else:
+                lines.append(f"🔧 {_trim(f'{tool} — {cleaned}', n - 2)}")
         elif kind == "tool_result":
-            meta = [str(it["status"]).strip()] if str(it.get("status") or "").strip() else []
-            if isinstance(it.get("exit_code"), int):
-                meta.append(f"exit {it['exit_code']}")
-            meta.append(_trim(text, n))
-            body = (f"{tool} — " if tool else "") + " · ".join(meta)
+            status = str(it.get("status") or "").strip().lower()
+            exit_code = it.get("exit_code")
+            has_exit = isinstance(exit_code, int) and not isinstance(exit_code, bool)
+            failed = status == "failed" or (has_exit and exit_code != 0)
+            icon = "❌" if failed else "✓"
+            cleaned = _clean_tool_result_text(text)
+            if not cleaned:
+                summary = f"{tool or '命令'}" + (f" (exit {exit_code})" if failed and has_exit else "")
+                lines.append(f"{icon} {_trim(summary, n - 2)}")
+            else:
+                parts = ([tool] if tool else []) + ([f"exit {exit_code}"] if failed and has_exit else []) + [cleaned]
+                lines.append(f"{icon} {_trim(' · '.join(parts), n - 2)}")
         else:
-            body = text
-        lines.append(f"{CARD_ICONS.get(kind, '•')} {_trim(body, n - 2)}")
+            lines.append(f"{CARD_ICONS.get(kind, '•')} {_trim(text, n - 2)}")
     agent = str(p.get("agent") or "Agent").strip() or "Agent"
     meta = {"title": f"{agent} · {CARD_STATES[state]}", "state": state, "steps": steps, "elapsed_sec": sec}
     return "\n".join(lines), json.dumps(meta, ensure_ascii=False)
