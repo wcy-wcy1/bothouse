@@ -253,6 +253,7 @@ class Hub:
                  user_mention_id: str | None = None):
         if not token:
             raise ValueError("RH_HUB_TOKEN 不能为空")
+        self.db_path = Path(db_path) if str(db_path) != ":memory:" else None
         self.token = token
         # cc-connect 的 bot 连 /cloud-web/ws 用的 token（环境变量 RH_BOT_TOKEN），和网页登录的分开：
         # 设了它，bot 只认它、网页接口不认它；没设时 bot 照旧用 RH_HUB_TOKEN（升级前的配置接着能连）。
@@ -292,6 +293,8 @@ class Hub:
         self.volumes: dict[str, int] = {}   # 主机报的板子音量（只有在线的板子）
         # 新消息建好、推给网页之后还要通知谁（rh/cloudweb.py：转给 cc-connect 驱动的 bot）
         self.listeners: list = []
+        self.bot_listeners: list = []
+        self.thinking_listeners: list = []
         self.bots_online: set[str] = set()   # 现在连着的 cc-connect bot（rh/cloudweb.py 维护）
         self.bot_thinking: dict[int, list[str]] = {}   # 频道 id -> 正在干活的 bot（按开始的先后；空的不在表里）
         # 推送：VAPID 钥匙、怎么算 @ 我（bot 照 Discord 习惯写 <@我的 Discord ID> 时也认，ID 只收数字，同 cloudweb mention_id）
@@ -326,6 +329,8 @@ class Hub:
 
     async def bots_changed(self) -> None:
         await self.broadcast({"type": "bots", "bots": self.bot_list()})
+        for fn in list(self.bot_listeners):
+            await fn()
 
     async def set_bot_thinking(self, room_id: int, bot_id: str, on: bool) -> None:
         cur = self.bot_thinking.get(room_id, [])
@@ -337,6 +342,8 @@ class Hub:
         else:
             self.bot_thinking.pop(room_id, None)
         await self.broadcast({"type": "bot_thinking", "room": room_id, "bots": new}, room_id)
+        for fn in list(self.thinking_listeners):
+            await fn(room_id, new)
 
     @staticmethod
     def preview_key(bot_id: str, ref: str) -> str:
@@ -940,17 +947,45 @@ class Hub:
 # ---------- HTTP ----------
 HUB_KEY = web.AppKey("hub", Hub)
 HISTORY_ROUTE = re.compile(r"/api/rooms/[^/]+/messages")   # GET /api/rooms/{room}/messages，bot 的 token 也能读
+AUTH_COOKIE = "rh_auth"
+
+
+def request_token(request: web.Request) -> str | None:
+    authorization = request.headers.get("Authorization", "")
+    if authorization.startswith("Bearer "):
+        return authorization[7:]
+    return request.cookies.get(AUTH_COOKIE)
+
+
+def is_web_authed(hub: Hub, request: web.Request) -> bool:
+    return hub.token_ok(request_token(request))
+
+
+def set_auth_cookie(resp: web.StreamResponse, hub: Hub, request: web.Request) -> None:
+    secure = request.scheme == "https" or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+    resp.set_cookie(AUTH_COOKIE, hub.token, httponly=True, path="/", samesite="Lax", max_age=2592000, secure=secure)
+
+
+def make_auth_gate_html(next_path: str) -> str:
+    safe_next = json.dumps(next_path).replace("<", "\\u003c")
+    return '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>需要验证</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#11151b;color:#edf1f5;font:16px system-ui}.card{width:min(360px,calc(100% - 40px));padding:28px;background:#1d242d;border:1px solid #38424e;border-radius:8px;box-sizing:border-box}h1{font-size:20px;margin:0 0 18px}input,button{box-sizing:border-box;width:100%;padding:12px;border-radius:5px;font:inherit}input{background:#11151b;color:white;border:1px solid #596574}button{margin-top:12px;border:0;background:#74c69d;color:#102019;cursor:pointer}#error{color:#ff9e9e;min-height:1.4em}</style>
+<main class="card"><h1>输入访问 token</h1><form id="form"><input id="token" type="password" autocomplete="current-password" aria-label="输入访问 token"><button>继续</button><p id="error" role="alert"></p></form></main>
+<script>const next=''' + safe_next + ''';async function sync(value){try{const r=await fetch('/api/auth/cookie',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:value})});if(r.ok){try{localStorage.setItem('rh_token',value)}catch{}location.replace(next);return true}}catch{}return false}const saved=localStorage.getItem('rh_token');if(saved)sync(saved).then(ok=>{if(!ok)document.querySelector('#token').focus()});document.querySelector('#form').addEventListener('submit',async e=>{e.preventDefault();const value=document.querySelector('#token').value;if(await sync(value))return;document.querySelector('#error').textContent='访问 token 无效';document.querySelector('#token').value=''});</script></html>'''
 
 
 def make_app(hub: Hub) -> web.Application:
     @web.middleware
     async def auth(request: web.Request, handler):
         if request.path.startswith("/api/"):
+            if request.path == "/api/auth/cookie" and request.method == "POST":
+                return await handler(request)
             h = request.headers.get("Authorization", "")
             tok = h[len("Bearer "):] if h.startswith("Bearer ") else None
             # bot 的 token 只能读频道历史（cc-connect 补发用，见文件头「历史与未读」），别的接口照旧只认网页的 token
             bot_read = request.method == "GET" and HISTORY_ROUTE.fullmatch(request.path) is not None
-            if not (hub.token_ok(tok) or bot_read and hub.bot_token_ok(tok)):
+            cookie_tok = request.cookies.get(AUTH_COOKIE)
+            if not (hub.token_ok(tok) or hub.token_ok(cookie_tok) or bot_read and hub.bot_token_ok(tok)):
                 raise web.HTTPUnauthorized(text="unauthorized")
         try:
             return await handler(request)
@@ -967,6 +1002,21 @@ def make_app(hub: Hub) -> web.Application:
             return json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             raise BadRequest("bad json")
+
+    async def auth_cookie(request):
+        token = request.headers.get("Authorization", "")
+        token = token[7:] if token.startswith("Bearer ") else None
+        if not hub.token_ok(token) and not hub.token_ok(request.cookies.get(AUTH_COOKIE)):
+            try:
+                body = await request.json()
+            except (ValueError, Exception):
+                body = {}
+            token = body.get("token") if isinstance(body, dict) else None
+        if not hub.token_ok(token) and not hub.token_ok(request.cookies.get(AUTH_COOKIE)):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        response = web.json_response({"ok": True})
+        set_auth_cookie(response, hub, request)
+        return response
 
     def room_or_404(request: web.Request) -> int:
         try:
@@ -1215,6 +1265,7 @@ def make_app(hub: Hub) -> web.Application:
     app = web.Application(middlewares=[auth], client_max_size=MAX_MEMBERS_BODY)
     app.add_routes([
         web.get("/", index),
+        web.post("/api/auth/cookie", auth_cookie),
         web.get("/ws", ws_handler),
         web.get("/ws/host", ws_host_handler),
         web.get("/queue-player.js", player_js),
@@ -1242,6 +1293,9 @@ def make_app(hub: Hub) -> web.Application:
         web.static("/icons", STATIC / "icons"),
     ])
     cloudweb.attach(app, hub)   # cc-connect 的 bot 从 /cloud-web/ws 接进来（rh/cloudweb.py）
+    from . import desk, panel_proxy
+    desk.attach(app, hub)
+    panel_proxy.attach(app, hub)
     if AVATARS.is_dir():
         app.add_routes([web.static("/avatars", AVATARS)])
 

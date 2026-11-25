@@ -134,6 +134,15 @@ function needToken(why) {
   (hooks().needToken || (() => {}))(why);
 }
 function setToken(t) { token = t; localStorage.setItem("rh_token", t); connect(); }
+let cookieSyncedToken = null;
+function syncAuthCookie() {
+  if (!token || cookieSyncedToken === token) return;
+  const syncing = token;
+  cookieSyncedToken = syncing;
+  fetch("/api/auth/cookie", {method: "POST", credentials: "same-origin", headers: {"Authorization": "Bearer " + syncing}})
+    .then((r) => { if (!r.ok && cookieSyncedToken === syncing) cookieSyncedToken = null; })
+    .catch(() => { if (cookieSyncedToken === syncing) cookieSyncedToken = null; });
+}
 
 function connect() {
   started = true;
@@ -151,6 +160,7 @@ function connect() {
   ws.onmessage = (e) => {
     const d = JSON.parse(e.data);
     if (d.type === "ready") {
+      syncAuthCookie();
       // 只认 hello 换回来的第一个 ready；之后同一条连接上的 ready（切频道的 join）都按新频道重来。
       const since = sent ? sent.since : null;
       sent = null;

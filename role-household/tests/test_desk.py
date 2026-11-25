@@ -1,0 +1,261 @@
+import asyncio
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from rh.hub import Hub, make_app
+
+
+def _create_t3_db(path: Path) -> None:
+    conn = sqlite3.connect(str(path))
+    conn.executescript("""
+        CREATE TABLE orchestration_v2_projection_threads (
+            thread_id TEXT PRIMARY KEY,
+            title TEXT
+        );
+        CREATE TABLE orchestration_v2_projection_runs (
+            run_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            requested_at TEXT,
+            completed_at TEXT
+        );
+        CREATE TABLE orchestration_v2_projection_subagents (
+            subagent_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            run_id TEXT,
+            child_thread_id TEXT,
+            status TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT
+        );
+    """)
+    now = datetime.now(timezone.utc)
+    t_sub_done = (now - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    t_sub_done_end = (now - timedelta(minutes=18)).isoformat().replace("+00:00", "Z")
+    t_sub_run = (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    conn.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?)", ("main-thread", "主控会话"))
+    conn.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?)", ("child-done", "历史完成子任务"))
+    conn.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?)", ("child-live", "实时运行子任务"))
+    conn.execute(
+        "INSERT INTO orchestration_v2_projection_runs VALUES (?, ?, ?, ?, ?)",
+        ("run-main", "main-thread", "running", t_sub_run, None),
+    )
+    conn.execute(
+        "INSERT INTO orchestration_v2_projection_runs VALUES (?, ?, ?, ?, ?)",
+        ("run-child-live", "child-live", "running", t_sub_run, None),
+    )
+    conn.execute(
+        "INSERT INTO orchestration_v2_projection_subagents VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("sub-done", "main-thread", "run-main", "child-done", "completed", t_sub_done, t_sub_done_end, t_sub_done_end),
+    )
+    conn.execute(
+        "INSERT INTO orchestration_v2_projection_subagents VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("sub-live", "main-thread", "run-main", "child-live", "running", t_sub_run, None, t_sub_run),
+    )
+    conn.commit()
+    conn.close()
+
+
+class DeskTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.t3_db = self.root / "statev2.sqlite"
+        _create_t3_db(self.t3_db)
+        self._prev_t3 = os.environ.get("RH_T3_STATE_DB")
+        self._prev_panel = os.environ.get("RH_PANEL_CONFIG")
+        os.environ["RH_T3_STATE_DB"] = str(self.t3_db)
+        os.environ.pop("RH_PANEL_CONFIG", None)
+        self.hub = Hub(self.root / "hub.sqlite3", "test-token")
+        self.app = make_app(self.hub)
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.hub.db.close()
+        if self._prev_t3 is None:
+            os.environ.pop("RH_T3_STATE_DB", None)
+        else:
+            os.environ["RH_T3_STATE_DB"] = self._prev_t3
+        if self._prev_panel is None:
+            os.environ.pop("RH_PANEL_CONFIG", None)
+        else:
+            os.environ["RH_PANEL_CONFIG"] = self._prev_panel
+        self.temp.cleanup()
+
+    async def test_cookie_auth_and_desk_routes(self):
+        for path in ("/collab/api/state", "/collab/api/desk/state", "/collab/api/desk/replay?from=x&to=y", "/collab/api/desk/names", "/collab/panel/api/v1/status"):
+            self.assertEqual((await self.client.get(path)).status, 401)
+        self.assertEqual((await self.client.put("/collab/api/desk/names", json={"id": "x", "name": "y"})).status, 401)
+        self.assertEqual((await self.client.post("/api/auth/cookie", json={"token": "bad"})).status, 401)
+
+        response = await self.client.post("/api/auth/cookie", json={"token": "test-token"})
+        self.assertEqual(response.status, 200)
+        self.assertIn("httponly", response.headers.get("Set-Cookie", "").lower())
+        self.assertEqual((await self.client.get("/collab/api/state")).status, 200)
+
+        redir = await self.client.get("/collab/desk?token=test-token", allow_redirects=False)
+        self.assertEqual(redir.status, 302)
+        self.assertEqual(redir.headers["Location"], "/collab/desk")
+
+        page = await self.client.get("/collab/desk")
+        self.assertEqual(page.status, 200)
+        html = await page.text()
+        self.assertIn('id="office"', html)
+        self.assertIn("t3-antigravity", html)
+
+    async def test_names_and_avatar(self):
+        headers = {"Authorization": "Bearer test-token"}
+        av = await self.client.get("/collab/avatars/orange.png", headers=headers)
+        self.assertEqual(av.status, 200)
+        self.assertEqual(av.headers.get("Content-Type"), "image/png")
+        self.assertEqual((await self.client.get("/collab/avatars/..%2Fhub.py", headers=headers)).status, 404)
+
+        result = await self.client.put("/collab/api/desk/names", json={"id": "local-codex", "name": "小码"}, headers=headers)
+        self.assertEqual(result.status, 200)
+        self.assertEqual((await result.json())["names"]["local-codex"], "小码")
+        names_resp = await self.client.get("/collab/api/desk/names", headers=headers)
+        self.assertEqual((await names_resp.json())["names"]["local-codex"], "小码")
+        self.assertEqual((await self.client.put("/collab/api/desk/names", json={"id": "x", "name": "x" * 25}, headers=headers)).status, 400)
+        cleared = await self.client.put("/collab/api/desk/names", json={"id": "local-codex", "name": ""}, headers=headers)
+        self.assertNotIn("local-codex", (await cleared.json())["names"])
+
+    async def test_t3_live_polling_lobby_isolation_and_replay(self):
+        headers = {"Authorization": "Bearer test-token"}
+        await asyncio.sleep(0.2)
+
+        state = await (await self.client.get("/collab/api/state", headers=headers)).json()
+        member_ids = [m["id"] for m in state["members"]]
+        self.assertIn("t3-antigravity", member_ids)
+        self.assertIn("t3-codex", member_ids)
+
+        desk_state = await (await self.client.get("/collab/api/desk/state", headers=headers)).json()
+        self.assertEqual([t["id"] for t in desk_state["tasks"]], ["sub-live"])
+        self.assertEqual(desk_state["tasks"][0]["title"], "实时运行子任务")
+
+        # Dispatch a Lobby task from remote-ll -> local-codex and ensure T3 polls do NOT evict it.
+        room_id = self.hub.first_room()
+        msg1, _ = self.hub.create(room_id, {
+            "author_kind": "role",
+            "author": "remote-ll",
+            "name": "小橘",
+            "text": "@codex 请跑一下测试\n\n*claude · out 10*",
+        })
+        await self.hub.notify_new(msg1)
+        desk_state_with_lobby = await (await self.client.get("/collab/api/desk/state", headers=headers)).json()
+        task_ids = {t["id"] for t in desk_state_with_lobby["tasks"]}
+        self.assertIn(f"lobby-{msg1['id']}", task_ids)
+        self.assertIn("sub-live", task_ids)
+
+        # Open SSE stream and complete the running T3 subagent; verify returned + done arrive cleanly.
+        sse_resp = await self.client.get("/collab/api/events", headers=headers)
+        self.assertEqual(sse_resp.status, 200)
+        try:
+            conn = sqlite3.connect(str(self.t3_db))
+            done_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            conn.execute(
+                "UPDATE orchestration_v2_projection_subagents SET status='completed', completed_at=? WHERE subagent_id='sub-live'",
+                (done_at,),
+            )
+            conn.commit()
+            conn.close()
+
+            kinds = []
+            deadline = asyncio.get_running_loop().time() + 4.0
+            while asyncio.get_running_loop().time() < deadline:
+                raw_line = await asyncio.wait_for(sse_resp.content.readline(), timeout=2.5)
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", "replace").strip()
+                if line.startswith("data: "):
+                    payload = json.loads(line[6:])
+                    if payload.get("type") == "task" and payload.get("id") == "sub-live":
+                        kinds.append(payload.get("kind"))
+                        if "done" in kinds:
+                            break
+            self.assertEqual(kinds, ["returned", "done"])
+        finally:
+            sse_resp.close()
+
+        # Verify Lobby completion & merged chronological replay
+        msg2, _ = self.hub.create(room_id, {
+            "author_kind": "role",
+            "author": "local-codex",
+            "name": "codex",
+            "text": "@小橘 测试已全部通过！",
+        })
+        await self.hub.notify_new(msg2)
+
+        now = datetime.now(timezone.utc)
+        q_from = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        q_to = (now + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        replay_resp = await self.client.get("/collab/api/desk/replay", params={"from": q_from, "to": q_to}, headers=headers)
+        self.assertEqual(replay_resp.status, 200)
+        replay_data = await replay_resp.json()
+        events = replay_data["events"]
+        self.assertTrue(any(e.get("type") == "message" and e["message"]["author"] == "remote-ll" for e in events))
+        self.assertTrue(any(e.get("type") == "task" and e.get("id") == "sub-done" and e.get("kind") == "assigned" for e in events))
+        self.assertTrue(any(e.get("type") == "task" and e.get("id") == "sub-done" and e.get("kind") == "done" for e in events))
+        self.assertTrue(any(e.get("type") == "task" and e.get("from") == "remote-ll" and e.get("to") == "local-codex" and e.get("kind") == "assigned" for e in events))
+
+        bad_replay = await self.client.get("/collab/api/desk/replay", params={"from": q_to, "to": q_from}, headers=headers)
+        self.assertEqual(bad_replay.status, 400)
+
+    async def test_panel_proxy(self):
+        captured = {}
+        upstream = web.Application()
+
+        async def page(request):
+            return web.Response(text="<html><head><base href=\"/\" /></head><body>ok</body></html>", content_type="text/html")
+
+        async def api(request):
+            captured.update({"authorization": request.headers.get("Authorization"), "cookie": request.headers.get("Cookie")})
+            return web.json_response({"ok": True})
+
+        upstream.router.add_get("/", page)
+        upstream.router.add_get("/api/v1/test", api)
+        server = TestServer(upstream)
+        await server.start_server()
+        try:
+            config = self.root / "panel.toml"
+            config.write_text(f'[management]\nenabled=true\nhost="127.0.0.1"\nport={server.port}\ntoken="mgmt-token"\n', encoding="utf-8")
+            await self.client.close()
+            os.environ["RH_PANEL_CONFIG"] = str(config)
+            self.app = make_app(self.hub)
+            self.client = TestClient(TestServer(self.app))
+            await self.client.start_server()
+
+            headers = {"Authorization": "Bearer test-token", "Cookie": "browser-secret=1"}
+            redirect = await self.client.get("/collab/panel", headers=headers, allow_redirects=False)
+            self.assertEqual(redirect.status, 308)
+            self.assertEqual(redirect.headers["Location"], "/collab/panel/")
+
+            html = await (await self.client.get("/collab/panel/", headers=headers)).text()
+            self.assertIn('<base href="/collab/panel/" />', html)
+            self.assertIn('<meta name="bothouse-auth" content="proxy" />', html)
+
+            result = await self.client.get("/collab/panel/api/v1/test", headers=headers)
+            self.assertEqual(result.status, 200)
+            self.assertEqual(captured["authorization"], "Bearer mgmt-token")
+            self.assertIsNone(captured["cookie"])
+
+            # Verify clean 502 error handling when upstream closes
+            await server.close()
+            down_api = await self.client.get("/collab/panel/api/v1/test", headers=headers)
+            self.assertEqual(down_api.status, 502)
+        finally:
+            await server.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

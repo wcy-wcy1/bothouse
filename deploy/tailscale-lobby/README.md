@@ -58,6 +58,27 @@ Test-NetConnection '<LOCAL_TAILSCALE_IP>' -Port 8790
 2. 在 Safari 分享菜单选「添加到主屏幕」。从新建的主屏幕图标打开大厅，按需重新登录，然后点「开通知」并允许通知。iPhone 需要 iOS 16.4 或更新版本。
 3. 将大厅切到后台，请角色发一条点名你的消息，确认通知出现且点开后能进入对应频道。
 
+## 6. 像素办公室（T3 Code × Bothouse）与 Web 管理面板
+
+`role-household` 现已内置 **T3 Code × Bothouse 像素办公室（`/collab/desk`）** 与 **Bothouse Web 管理面板反向代理（`/collab/panel/`）**，桌面端、T3 Preview 与 iPhone PWA 均可复用现有的 `443` Tailscale Serve 入口与 Cookie 登录态，无需新增 Tailnet 端口或 ACL 规则：
+
+1. 本机配置启用管理面板后重启 Bothouse（详见 `local-codex-cloud-web.toml.example` 末尾注释中的 `[management]` 节，建议绑定 `127.0.0.1:9820` 并使用随机管理 token）。
+2. 启动 Hub 时传入 `-T3StateDb`、`-PanelConfig` 与可选 `-LogFile`：
+
+~~~powershell
+.\deploy\windows-team\Start-Lobby.ps1 `
+    -StateDirectory (Join-Path $env:USERPROFILE '.bothouse/hub') `
+    -UserMentionId '<USER_DISCORD_ID>' `
+    -T3StateDb '<T3CODE_STATE_DB>' `
+    -PanelConfig '<BOTHOUSE_CONFIG_TOML>' `
+    -LogFile (Join-Path $env:USERPROFILE '.bothouse/hub/hub.log')
+~~~
+
+- **Windows APNs 证书自动注入**：传入 `-PythonPath` 且未预设 `SSL_CERT_FILE` 时，`Start-Lobby.ps1` 会在启动 `rh.hub` 前自动读取 `certifi.where()` 写入 `SSL_CERT_FILE`，确保 Windows `aiohttp` 向苹果 APNs 发送 Web Push 时 TLS 验证通过。
+- **统一入口**：
+  - 聊天大厅 `/` 左侧服务器栏新增 **`办`**（`/collab/desk`）与 **`管`**（`/collab/panel/`），登录聊天大厅时自动同步 `HttpOnly` Cookie（`rh_auth`）。
+  - 像素办公室 `/collab/desk` 同时实时呈现大厅 Bot（如 `remote-ll`、`local-codex`）与 T3 Code 只读状态库（`t3-antigravity` 主控与 `t3-codex` 子代理委派/完成光束及回放）。
+
 ## 验证
 
 在本机运行以下命令。`-ExpectOnlineBots` 使用 URL 中的 `bot` 值。做 WebSocket 检查时，`-PythonPath` 指向安装了 `aiohttp` 的 Python 3.11 或更新版本：

@@ -19,3 +19,11 @@ allow_from = "user"
 share_session_in_channel = true
 group_reply_all = false
 team_lead_bot = "<LEAD_MENTION_ID>"
+
+# Optional: enable the built-in Bothouse management dashboard so rh.hub can reverse-proxy it at /collab/panel/
+# [management]
+# enabled = true
+# host = "127.0.0.1"
+# port = 9820
+# token = "<MANAGEMENT_TOKEN>"
+
