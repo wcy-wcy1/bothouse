@@ -1,0 +1,15 @@
+{
+  "grants": [
+    {
+      "src": ["100.64.0.20/32"],
+      "dst": ["100.64.0.10/32"],
+      "ip": ["tcp:8790"],
+    },
+    // Optional phone access. Enable this grant for the phone's Tailnet IP.
+    // {
+    //   "src": ["100.64.0.30/32"],
+    //   "dst": ["100.64.0.10/32"],
+    //   "ip": ["tcp:443", "tcp:8790"],
+    // },
+  ],
+}

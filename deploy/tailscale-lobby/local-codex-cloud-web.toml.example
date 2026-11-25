@@ -1,0 +1,21 @@
+# Merge the agent options into the existing local Codex project and append the platform.
+[projects.agent]
+type = "codex"
+
+[projects.agent.options]
+work_dir = "D:/CC+CODEX"
+mode = "full-auto"
+codex_home = "C:/Users/<USER>/.bothouse/codex-home/<CODEX_BOT_ID>"
+cmd = "codex"
+
+[[projects.platforms]]
+type = "cloud_web"
+
+[projects.platforms.options]
+transport = "websocket"
+ws_url = "ws://127.0.0.1:8790/cloud-web/ws?bot=<CODEX_BOT_ID>&mention_id=<CODEX_MENTION_ID>&name=<CODEX_NAME>"
+token = "${BOTHOUSE_LOBBY_BOT_TOKEN}"
+allow_from = "user"
+share_session_in_channel = true
+group_reply_all = false
+team_lead_bot = "<LEAD_MENTION_ID>"

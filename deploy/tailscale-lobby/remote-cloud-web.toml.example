@@ -1,0 +1,11 @@
+# Append this platform to the existing remote lead project.
+[[projects.platforms]]
+type = "cloud_web"
+
+[projects.platforms.options]
+transport = "websocket"
+ws_url = "ws://<LOCAL_TAILSCALE_IP>:8790/cloud-web/ws?bot=<LEAD_BOT_ID>&mention_id=<LEAD_MENTION_ID>&name=<LEAD_NAME>"
+token = "${BOTHOUSE_LOBBY_BOT_TOKEN}"
+allow_from = "user"
+share_session_in_channel = true
+group_reply_all = false
