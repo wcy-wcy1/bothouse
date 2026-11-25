@@ -83,6 +83,8 @@ Test-NetConnection '<LOCAL_TAILSCALE_IP>' -Port 8790
   - **团队调度模式**：聊天大厅顶部栏提供 `单兵` / `混合` / `团队` 三档模式切换（支持工作区继承主频道配置），也可发送 `/solo`、`/mixed`、`/team` 持久切换，或用 `/team <任务>` / `团队模式：<任务>` 单轮强制触发团队协作。
   - **智能闸门（Gate）分流（可选）**：当本机启用 Bothouse `gate`（配合本机 Ollama / JEV 模型）且仅在 `cloud_web` 平台开启 `group_reply_all = true`（`discord` 保持 `false` 隔离）时，可通过 `[projects].gate_url` 接入智能判断；远端主角色可直接通过 `rh.hub` 在 Tailnet 8790 提供的鉴权反向代理 `http://<LOCAL_TAILSCALE_IP>:8790/gate/<BOT_TOKEN>/decide` 共用同一个本地 Gate，实现不 `@` 自动选人接话与打断/插话控制。
 
+    对于 `qwen3.5:4b` 等本机 Ollama 思考模型，`rh.hub` 在 `http://127.0.0.1:8790/ollama-jev/v1` 提供 OpenAI 兼容接口，将 `chat_template_kwargs.enable_thinking = false` 映射为 `reasoning_effort = "none"`。接口要求 TCP 对端为回环地址，校验 `Host`，并拒绝携带 `X-Forwarded-For`、`Forwarded` 或 `Tailscale-User-Login` 的请求（检查失败返回 `403`）。在 Bothouse JEV 的 `api_key` 中配置 Hub 令牌，缺少或无效的 Bearer 令牌会返回 `401`。Hub 在转发到 Ollama 前移除 `Authorization` 请求头。
+
 ## 验证
 
 在本机运行以下命令。`-ExpectOnlineBots` 使用 URL 中的 `bot` 值。做 WebSocket 检查时，`-PythonPath` 指向安装了 `aiohttp` 的 Python 3.11 或更新版本：

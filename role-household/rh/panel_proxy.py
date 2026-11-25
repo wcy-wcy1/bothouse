@@ -3,24 +3,70 @@ from __future__ import annotations
 
 import asyncio
 import html
+import ipaddress
 import json
 import os
 import re
 import tomllib
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
 from .hub import is_web_authed, make_auth_gate_html, set_auth_cookie
 
 PANEL_PREFIX = "/collab/panel"
+OLLAMA_JEV_PREFIX = "/ollama-jev/v1"
 GATE_ALLOWED_PATHS = {"decide", "context", "lead", "whoami", "memvote"}
 SAFE_REQUEST_HEADERS = {"accept", "accept-language", "content-type", "if-none-match", "if-modified-since", "range"}
 SAFE_RESPONSE_HEADERS = {
     "content-type", "cache-control", "etag", "last-modified",
     "content-disposition", "content-range", "accept-ranges",
 }
+
+
+def _is_loopback_ip(raw_ip: str | None) -> bool:
+    if not raw_ip:
+        return False
+    cleaned = raw_ip.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address):
+        addr = addr.ipv4_mapped or addr
+    return bool(addr.is_loopback)
+
+
+def _is_loopback_request(request: web.Request) -> bool:
+    peer = request.transport.get_extra_info("peername") if request.transport is not None else None
+    ip = peer[0] if isinstance(peer, tuple) and peer else None
+    if not _is_loopback_ip(ip):
+        return False
+    if any(header in request.headers for header in ("X-Forwarded-For", "Forwarded", "Tailscale-User-Login")):
+        return False
+    if request.host:
+        try:
+            host = urlsplit(f"//{request.host}").hostname
+        except ValueError:
+            return False
+        if not host or (host.lower() != "localhost" and not _is_loopback_ip(host)):
+            return False
+    return True
+
+
+def _rewrite_ollama_jev_body(payload: dict) -> dict:
+    out = dict(payload)
+    ctk = out.get("chat_template_kwargs")
+    if isinstance(ctk, dict) and ctk.get("enable_thinking") is False:
+        out.setdefault("reasoning_effort", "none")
+        cleaned_ctk = dict(ctk)
+        cleaned_ctk.pop("enable_thinking")
+        if cleaned_ctk:
+            out["chat_template_kwargs"] = cleaned_ctk
+        else:
+            out.pop("chat_template_kwargs", None)
+    return out
 
 
 def rewrite_panel_html(body: str, prefix: str = PANEL_PREFIX) -> str:
@@ -56,6 +102,7 @@ def _notice_html(reason: str, help_text: str = "") -> str:
 
 def attach(app: web.Application, hub, config_path: str | Path | None = None) -> None:
     cfg_path = config_path or os.environ.get("RH_PANEL_CONFIG")
+    ollama_base = os.environ.get("RH_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
     session: ClientSession | None = None
 
     def _read_toml() -> tuple[dict | None, str | None, str]:
@@ -272,6 +319,57 @@ def attach(app: web.Application, hub, config_path: str | Path | None = None) -> 
         except (ClientError, OSError, asyncio.TimeoutError):
             return web.json_response({"ok": False, "error": "gate unreachable"}, status=502)
 
+    async def ollama_jev_proxy(request: web.Request):
+        if not _is_loopback_request(request):
+            return web.json_response({"ok": False, "error": "loopback only"}, status=403)
+
+        auth = request.headers.get("Authorization", "")
+        tok = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+        if not (tok and (hub.bot_token_ok(tok) or hub.token_ok(tok))):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        tail = request.match_info.get("tail", "").lstrip("/")
+        allowed_method = {"models": "GET", "chat/completions": "POST"}.get(tail)
+        if allowed_method is None:
+            return web.json_response({"ok": False, "error": "not found"}, status=404)
+        if request.method != allowed_method:
+            return web.json_response({"ok": False, "error": "method not allowed"}, status=405)
+        if session is None:
+            return web.json_response({"ok": False, "error": "proxy session unavailable"}, status=502)
+
+        headers = {}
+        body = None
+        if request.method == "POST":
+            raw_body = await request.read()
+            try:
+                data = json.loads(raw_body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+            if not isinstance(data, dict):
+                return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+            body = json.dumps(_rewrite_ollama_jev_body(data), ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        upstream_url = f"{ollama_base}/v1/{tail}"
+        if request.query_string:
+            upstream_url += f"?{request.query_string}"
+        try:
+            async with session.request(
+                request.method,
+                upstream_url,
+                headers=headers,
+                data=body,
+                timeout=ClientTimeout(total=30.0),
+                allow_redirects=False,
+            ) as upstream:
+                payload = await upstream.read()
+                out_headers = {}
+                if "Content-Type" in upstream.headers:
+                    out_headers["Content-Type"] = upstream.headers["Content-Type"]
+                return web.Response(body=payload, status=upstream.status, headers=out_headers)
+        except (ClientError, OSError, asyncio.TimeoutError):
+            return web.json_response({"ok": False, "error": "ollama unreachable"}, status=502)
+
     async def startup(app: web.Application) -> None:
         nonlocal session
         session = ClientSession()
@@ -289,6 +387,7 @@ def attach(app: web.Application, hub, config_path: str | Path | None = None) -> 
     if bcfg and bcfg["path"] != "/bridge/ws":
         app.router.add_get(bcfg["path"], bridge_ws)
     app.router.add_route("*", "/gate/{bot_tok}/{tail:.*}", gate_proxy)
+    app.router.add_route("*", f"{OLLAMA_JEV_PREFIX}/{{tail:.*}}", ollama_jev_proxy)
     app.router.add_get(PANEL_PREFIX, legacy)
     app.router.add_route("*", f"{PANEL_PREFIX}/", proxy)
     app.router.add_route("*", f"{PANEL_PREFIX}/{{tail:.*}}", proxy)

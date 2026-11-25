@@ -6,12 +6,14 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from rh.cloudweb import PROGRESS_PREFIX, card_from
 from rh.hub import Hub, make_app
+from rh.panel_proxy import _is_loopback_ip
 
 
 def _create_t3_db(path: Path) -> None:
@@ -76,10 +78,12 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
         self._prev_panel = os.environ.get("RH_PANEL_CONFIG")
         self._prev_wiki = os.environ.get("RH_WIKI_DIR")
         self._prev_gate = os.environ.get("RH_GATE_URL")
+        self._prev_ollama = os.environ.get("RH_OLLAMA_URL")
         os.environ["RH_T3_STATE_DB"] = str(self.t3_db)
         os.environ.pop("RH_PANEL_CONFIG", None)
         os.environ.pop("RH_WIKI_DIR", None)
         os.environ.pop("RH_GATE_URL", None)
+        os.environ.pop("RH_OLLAMA_URL", None)
         self.hub = Hub(self.root / "hub.sqlite3", "test-token")
         self.app = make_app(self.hub)
         self.client = TestClient(TestServer(self.app))
@@ -104,6 +108,10 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
             os.environ.pop("RH_GATE_URL", None)
         else:
             os.environ["RH_GATE_URL"] = self._prev_gate
+        if self._prev_ollama is None:
+            os.environ.pop("RH_OLLAMA_URL", None)
+        else:
+            os.environ["RH_OLLAMA_URL"] = self._prev_ollama
         self.temp.cleanup()
 
     async def test_cookie_auth_and_desk_routes(self):
@@ -506,6 +514,95 @@ class DeskTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured["body"], {"content": "hi"})
         finally:
             await server.close()
+
+
+    async def test_ollama_jev_proxy(self):
+        for ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            with self.subTest(ip=ip):
+                self.assertTrue(_is_loopback_ip(ip))
+        for ip in ("100.64.0.1", "192.168.1.5", None, "bad"):
+            with self.subTest(ip=ip):
+                self.assertFalse(_is_loopback_ip(ip))
+
+        models = {"object": "list", "data": [{"id": "qwen3.5:4b", "object": "model"}]}
+        captured = []
+        seen_auth = []
+        upstream = web.Application()
+
+        async def list_models(request):
+            seen_auth.append(request.headers.get("Authorization"))
+            return web.json_response(models)
+
+        async def chat_completions(request):
+            seen_auth.append(request.headers.get("Authorization"))
+            captured.append(await request.json())
+            return web.json_response({"choices": []})
+
+        upstream.router.add_get("/v1/models", list_models)
+        upstream.router.add_post("/v1/chat/completions", chat_completions)
+        async with TestServer(upstream) as server:
+            await self.client.close()
+            os.environ["RH_OLLAMA_URL"] = str(server.make_url("/"))
+            self.app = make_app(self.hub)
+            self.client = TestClient(TestServer(self.app))
+            await self.client.start_server()
+
+            prefix = "/ollama-jev/v1"
+            models_path = f"{prefix}/models"
+            chat_path = f"{prefix}/chat/completions"
+            headers = {"Authorization": "Bearer test-token"}
+            with patch("rh.panel_proxy._is_loopback_request", return_value=False):
+                self.assertEqual((await self.client.get(models_path, headers=headers)).status, 403)
+                self.assertEqual((await self.client.post(chat_path, json={}, headers=headers)).status, 403)
+
+            for header, value in (
+                ("Host", "100.64.0.1:8790"),
+                ("Host", "[::1"),
+                ("X-Forwarded-For", "100.64.0.1"),
+                ("Forwarded", "for=100.64.0.1"),
+                ("Tailscale-User-Login", "user@example.com"),
+            ):
+                with self.subTest(header=header, value=value):
+                    response = await self.client.get(models_path, headers={**headers, header: value})
+                    self.assertEqual(response.status, 403)
+
+            for invalid_headers in ({}, {"Authorization": "Bearer wrong"}):
+                with self.subTest(headers=invalid_headers):
+                    self.assertEqual((await self.client.get(models_path, headers=invalid_headers)).status, 401)
+                    self.assertEqual((await self.client.post(chat_path, json={}, headers=invalid_headers)).status, 401)
+
+            self.assertEqual((await self.client.get(f"{prefix}/embeddings", headers=headers)).status, 404)
+            self.assertEqual((await self.client.get(f"{prefix}/../tags", headers=headers)).status, 404)
+            self.assertEqual((await self.client.post(models_path, json={}, headers=headers)).status, 405)
+            self.assertEqual((await self.client.get(chat_path, headers=headers)).status, 405)
+            self.assertEqual((await self.client.post(chat_path, data=b"{", headers=headers)).status, 400)
+            self.assertEqual((await self.client.post(chat_path, json=[], headers=headers)).status, 400)
+
+            response = await self.client.get(models_path, headers=headers)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), models)
+
+            payload = {
+                "model": "qwen3.5:4b",
+                "chat_template_kwargs": {"enable_thinking": False},
+                "max_tokens": 1,
+            }
+            response = await self.client.post(chat_path, json=payload, headers=headers)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(captured, [{"model": "qwen3.5:4b", "max_tokens": 1, "reasoning_effort": "none"}])
+
+            payload["reasoning_effort"] = "low"
+            payload["chat_template_kwargs"]["other_option"] = True
+            response = await self.client.post(chat_path, json=payload, headers=headers)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(captured[-1], {
+                "model": "qwen3.5:4b",
+                "max_tokens": 1,
+                "reasoning_effort": "low",
+                "chat_template_kwargs": {"other_option": True},
+            })
+            self.assertTrue(seen_auth)
+            self.assertTrue(all(auth is None for auth in seen_auth), seen_auth)
 
 
 if __name__ == "__main__":
