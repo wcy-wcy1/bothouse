@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import socket
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -69,6 +70,10 @@ class NoRedirects(HTTPRedirectHandler):
 
 
 class ShimHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        if sys.stderr is not None:
+            super().log_message(format, *args)
+
     def __getattr__(self, name):
         # Route every HTTP method through the same access and path checks.
         if name.startswith("do_"):
@@ -171,7 +176,8 @@ def main(argv=None):
         parser.error("--port must be between 0 and 65535")
     try:
         with create_server(args.host, args.port, args.upstream, args.token) as server:
-            print(f"Ollama JEV shim listening on {args.host}:{server.server_port}", flush=True)
+            if sys.stdout is not None:
+                print(f"Ollama JEV shim listening on {args.host}:{server.server_port}", flush=True)
             server.serve_forever()
     except KeyboardInterrupt:
         pass

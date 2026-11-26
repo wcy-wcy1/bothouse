@@ -381,8 +381,16 @@ def upload_discord_avatar(token, image_path, proxy="", api_base=DISCORD_API):
         raise ValueError("Avatar must be a PNG, JPEG, or WebP image")
     encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
     data = json.dumps({"avatar": f"data:image/{image_type};base64,{encoded}"}).encode("utf-8")
-    request = Request(api_base.rstrip("/") + "/users/@me", data=data, method="PATCH",
-                      headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"})
+    request = Request(
+        api_base.rstrip("/") + "/users/@me",
+        data=data,
+        method="PATCH",
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://bothouse, 1.0)",
+        },
+    )
     proxies = {"http": proxy, "https": proxy} if proxy else {}
     opener = build_opener(ProxyHandler(proxies), NoRedirects())
     try:
