@@ -1,0 +1,52 @@
+# Pure Discord 双机器人示例。请先替换服务器 ID，再为每只机器人配置自己的 Token。
+# 建议把 Token 放在环境变量里。填写 token 时，请把这份文件保存在私有目录。
+
+[discord]
+guild_id = "<DISCORD_SERVER_ID>"
+# 可选。留空时 Bot 可以在服务器内其有权限访问的频道使用。
+channel_id = ""
+# "*" 允许所有人发指令。个人队伍可改为 "<YOUR_DISCORD_USER_ID>"。
+allow_from = "*"
+language = "zh"
+ack_reaction = true
+proxy = ""
+# 若 Discord 需要通过本机 Clash 访问，可设置 proxy = "http://127.0.0.1:7897"。
+# fallback_role = "ju"
+
+[gate]
+enabled = true
+# addressed 处理 @、回复或显式点名。smart 让 Gate 判断哪些角色应接未点名消息。
+mode = "addressed"
+
+# 使用 smart 时可启用以下任意一组 JEV 配置。
+# Apple Silicon + mlx-lm
+# [jev]
+# base_url = "http://127.0.0.1:9941/v1"
+# model = "mlx-community/Qwen3.5-4B-MLX-4bit"
+
+# Ollama + 独立兼容 shim（macOS 或 Windows）
+# [jev]
+# base_url = "http://127.0.0.1:11435/v1"
+# model = "qwen3.5:4b"
+# api_key_env = "OLLAMA_JEV_TOKEN"  # 仅在 shim 配置了 Bearer token 时启用
+
+[[roles]]
+project = "ju"
+name = "橘"
+agent_type = "claudecode"
+persona = "ju"
+# 设置名为 DISCORD_JU_TOKEN 的环境变量，也可以用 token 字段。
+token_env = "DISCORD_JU_TOKEN"
+
+[[roles]]
+project = "longniang"
+name = "龙娘"
+agent_type = "codex"
+persona = "longniang"
+codex_home_isolate = true
+# 可替换为 token_env = "DISCORD_LONGNIANG_TOKEN"。
+token = "<BOT_TOKEN>"
+
+# persona_file 与 avatar_file 可填写相对于本文件的路径。
+# avatar = "dragon" 可选择角色库内的其他头像 slug。
+# edit_persona = true 会让 Bothouse 更新已有项目的人设文件。
