@@ -16,9 +16,8 @@ import (
 
 const aboutUsage = `Usage: bothouse about [--config PATH]
 
-Print what bothouse is (features, how it compares with other projects, roadmap), this
-binary's version, and this machine's setup: roles, the CLI each runs, connected platforms.
-No tokens or keys are printed. Roles run this when asked what bothouse or they are.
+Print the version and this machine's setup, including roles, the CLI each runs, and connected platforms.
+No tokens or keys are printed.
 `
 
 func runAbout(args []string) {
@@ -57,7 +56,9 @@ func aboutCommand(args []string, out io.Writer) error {
 		v = "dev"
 	}
 	fmt.Fprintf(out, "bothouse version: %s\n\n", v)
-	fmt.Fprint(out, strings.TrimRight(doc, "\n")+"\n\n")
+	if strings.TrimSpace(doc) != "" {
+		fmt.Fprint(out, strings.TrimRight(doc, "\n")+"\n\n")
+	}
 	fmt.Fprint(out, aboutLocalSetup(cfg, cfgErr, path, os.Getenv("CC_PROJECT"), strings.HasPrefix(strings.ToLower(lang), "zh")))
 	return nil
 }
